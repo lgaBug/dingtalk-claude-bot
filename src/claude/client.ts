@@ -50,6 +50,26 @@ export class ClaudeClient {
   private pendingRequests: Map<string, PendingRequest | null> = new Map();
   private sessionErrors: Map<string, string> = new Map();
   private sessionPids: Map<string, number> = new Map();
+  private sharedSessionId?: string; // 当前共享进程的 sessionId（随机生成）
+
+  // 从 session 文件加载到内存，确保与文件同步
+  private loadSessionsFromFile(): void {
+    try {
+      if (fs.existsSync(SESSION_FILE)) {
+        const sessions: SessionInfo[] = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+        // 重建 this.sessionPids，只保留文件中有且状态为 running 的
+        this.sessionPids.clear();
+        for (const session of sessions) {
+          if (session.status === 'running' || session.status === 'stopping') {
+            this.sessionPids.set(session.sessionId, session.pid);
+          }
+        }
+        logger.info('Claude-Code', 'Loaded sessions from file', { count: this.sessionPids.size });
+      }
+    } catch (e) {
+      logger.error('Claude-Code', 'Failed to load sessions from file', { error: e });
+    }
+  }
 
   private saveSessions(): void {
     const sessions: SessionInfo[] = [];
@@ -79,10 +99,22 @@ export class ClaudeClient {
   }
 
   // 创建一个共享的 Claude CLI 进程，用于所有消息
-  async createSharedProcess(): Promise<void> {
-    // 使用固定的 UUID 作为 shared sessionId
-    const sharedSessId = '00000000-0000-4000-8000-000000000000';
+  async createSharedProcess(): Promise<boolean> {
+    // 每次启动生成新的随机 sessionId，避免与外部进程冲突
+    const sharedSessId = randomUUID();
+    this.sharedSessionId = sharedSessId;
     logger.info('Claude-Code', 'Creating shared Claude process', { sessionId: sharedSessId });
+
+    // 从 session 文件重新加载 sessions，确保内存与文件同步
+    this.loadSessionsFromFile();
+
+    // 清理可能存在的旧共享进程（从已同步的 session 文件读取）
+    this.killStoredProcesses();
+
+    // 清理当前实例中可能存在的旧共享进程
+    if (this.sharedSessionId && this.sharedSessionId !== sharedSessId) {
+      this.closeSession(this.sharedSessionId);
+    }
 
     const proc = this.createProcess(sharedSessId);
     this.processes.set(sharedSessId, proc);
@@ -91,32 +123,68 @@ export class ClaudeClient {
     this.sessionPids.set(sharedSessId, proc.pid!);
     this.saveSessions();
 
-    // 等待初始化完成
-    await new Promise<void>((resolve) => {
+    // 等待初始化完成或冲突错误
+    // 注意：需要同时等待 stderr 冲突检测和进程关闭事件
+    const hasConflict = await new Promise<boolean>((resolve) => {
       let resolved = false;
+      let stderrContent = '';
+
+      // 设置超时，如果进程在5秒内没有出现问题，则认为初始化成功
       const timeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
-          resolve();
+          // 检查是否有累积的 stderr 内容包含冲突错误
+          if (stderrContent.includes('already in use')) {
+            logger.warn('Claude-Code', 'Shared session conflict detected in stderr', { sessionId: sharedSessId });
+            resolve(true);
+          } else {
+            resolve(false);  // 没有冲突，超时认为成功
+          }
         }
       }, 5000);
 
       if (proc.stderr) {
         proc.stderr.on('data', (data: Buffer) => {
           const content = data.toString();
+          stderrContent += content;
           if (content.includes('already in use')) {
             logger.warn('Claude-Code', 'Shared session conflict during init', { sessionId: sharedSessId });
             if (!resolved) {
               resolved = true;
+              clearTimeout(timeout);
               this.sessionErrors.set(sharedSessId, content);
-              resolve();
+              resolve(true);  // 有冲突
             }
           }
         });
       }
+
+      // 监听进程关闭事件
+      proc.on('close', (code) => {
+        if (code !== 0 && !resolved) {
+          logger.warn('Claude-Code', 'Shared process closed unexpectedly', { sessionId: sharedSessId, code });
+          if (stderrContent.includes('already in use') || code === 1) {
+            // 进程异常关闭且有冲突迹象
+            if (!resolved) {
+              resolved = true;
+              clearTimeout(timeout);
+              this.sessionErrors.set(sharedSessId, stderrContent || `Exit code ${code}`);
+              resolve(true);
+            }
+          }
+        }
+      });
     });
 
+    if (hasConflict) {
+      // 清理失败的进程
+      this.closeSession(sharedSessId);
+      logger.error('Claude-Code', 'Shared Claude process failed to initialize');
+      return false;
+    }
+
     logger.info('Claude-Code', 'Shared Claude process ready', { sessionId: sharedSessId });
+    return true;
   }
 
   async streamMessage(options: StreamMessageOptions, sessionId?: string) {
@@ -129,9 +197,9 @@ export class ClaudeClient {
     logger.info('Claude-Code', 'User message', { message: userMessage.substring(0, 100) });
     logger.debug('Claude-Code', 'Conversation history', { historyLength: conversationHistory.length });
 
-    // 优先使用固定的 shared sessionId（如果存在且没有错误）
-    const sharedSessId = '00000000-0000-4000-8000-000000000000';
-    let currentSessId = sharedSessId;
+    // 优先使用 shared sessionId（如果存在且没有错误）
+    const sharedSessId = this.sharedSessionId;
+    let currentSessId = sharedSessId || '';
     const sharedProc = this.processes.get(sharedSessId);
     const sharedError = this.sessionErrors.get(sharedSessId);
 
@@ -387,18 +455,81 @@ export class ClaudeClient {
     });
   }
 
+  // 从 session 文件中读取并杀掉记录的进程（使用 /T 杀整个进程树）
+  private killStoredProcesses(): void {
+    try {
+      if (fs.existsSync(SESSION_FILE)) {
+        const sessions: SessionInfo[] = JSON.parse(fs.readFileSync(SESSION_FILE, 'utf-8'));
+        for (const session of sessions) {
+          if (session.status === 'running' || session.status === 'stopping') {
+            logger.info('Claude-Code', 'Killing stored process tree', { sessionId: session.sessionId, pid: session.pid });
+            try {
+              // 使用 /T 杀整个进程树（包括 bash 和 claude 子进程）
+              spawn('taskkill', ['/F', '/T', '/PID', session.pid.toString()], { shell: true });
+            } catch (e) {
+              // 进程可能已经不存在
+            }
+          }
+        }
+      }
+    } catch (e) {
+      logger.error('Claude-Code', 'Failed to kill stored processes', { error: e });
+    }
+  }
+
   // 关闭指定会话的进程
   closeSession(sessId: string) {
     const proc = this.processes.get(sessId);
     if (proc) {
       this.updateSessionStatus(sessId, 'stopping');
-      proc.kill();
+      // 使用 taskkill /T 杀整个进程树（包括 bash 和 claude 子进程）
+      spawn('taskkill', ['/F', '/T', '/PID', proc.pid!.toString()], { shell: true });
       this.processes.delete(sessId);
       this.buffers.delete(sessId);
       this.pendingRequests.delete(sessId);
       this.sessionPids.delete(sessId);
       logger.info('Claude-Code', 'Session closed', { sessionId: sessId });
       this.saveSessions();
+    }
+  }
+
+  // 关闭指定会话并等待进程真正退出
+  async closeSessionAsync(sessId: string): Promise<void> {
+    const proc = this.processes.get(sessId);
+    if (proc) {
+      this.updateSessionStatus(sessId, 'stopping');
+      return new Promise<void>((resolve) => {
+        const pid = proc.pid;
+        // 使用 taskkill /T 杀整个进程树（包括 bash 和 claude 子进程）
+        spawn('taskkill', ['/F', '/T', '/PID', pid.toString()], { shell: true });
+        // 等待进程退出，最多 3 秒
+        const timeout = setTimeout(() => {
+          logger.warn('Claude-Code', 'Process did not exit in time, forcing', { sessionId: sessId, pid });
+          try {
+            // 使用 /T 杀进程树
+            spawn('taskkill', ['/F', '/T', '/PID', pid.toString()], { shell: true });
+          } catch (e) {
+            // ignore
+          }
+          // 确保清理内存和保存状态
+          this.processes.delete(sessId);
+          this.buffers.delete(sessId);
+          this.pendingRequests.delete(sessId);
+          this.sessionPids.delete(sessId);
+          this.saveSessions();
+          resolve();
+        }, 3000);
+        proc.on('exit', () => {
+          clearTimeout(timeout);
+          this.processes.delete(sessId);
+          this.buffers.delete(sessId);
+          this.pendingRequests.delete(sessId);
+          this.sessionPids.delete(sessId);
+          logger.info('Claude-Code', 'Session closed', { sessionId: sessId });
+          this.saveSessions();
+          resolve();
+        });
+      });
     }
   }
 
@@ -409,10 +540,12 @@ export class ClaudeClient {
     }
   }
 
-  // 关闭所有会话
-  closeAll() {
+  // 关闭所有会话并等待进程真正退出
+  async closeAllAsync(): Promise<void> {
+    const closePromises: Promise<void>[] = [];
     for (const [sessId] of this.processes) {
-      this.closeSession(sessId);
+      closePromises.push(this.closeSessionAsync(sessId));
     }
+    await Promise.all(closePromises);
   }
 }

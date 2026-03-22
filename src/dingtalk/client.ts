@@ -27,6 +27,26 @@ export class DingTalkClient {
     this.bot = bot;
   }
 
+  // 关闭 DingTalk 连接
+  close(): void {
+    if (this.dwClient) {
+      logger.info('DingTalk-Client', 'Closing DingTalk stream connection');
+      try {
+        // @ts-ignore - close 方法存在
+        if (typeof this.dwClient.close === 'function') {
+          // @ts-ignore
+          this.dwClient.close();
+        } else if (typeof this.dwClient.disconnect === 'function') {
+          // @ts-ignore
+          this.dwClient.disconnect();
+        }
+      } catch (e) {
+        logger.error('DingTalk-Client', 'Error closing stream', { error: e });
+      }
+      this.dwClient = undefined;
+    }
+  }
+
   async startStream() {
     try {
       await this.connectStream();

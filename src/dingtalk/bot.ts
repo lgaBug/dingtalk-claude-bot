@@ -29,17 +29,23 @@ export class DingTalkBot {
   }
 
   // 预初始化 Claude CLI，等待完成后才接收消息
-  async preInitializeClaude(): Promise<void> {
-    if (this.initialized) return;
+  async preInitializeClaude(): Promise<boolean> {
+    if (this.initialized) return true;
 
     logger.info('DingTalk-Bot', 'Pre-initializing Claude CLI...');
 
     // 使用固定的 'shared' sessionId 来预初始化
     // 这样所有后续请求都会复用这个进程
-    await this.claude.createSharedProcess();
+    const success = await this.claude.createSharedProcess();
 
-    this.initialized = true;
-    logger.info('DingTalk-Bot', 'Claude CLI pre-initialization complete');
+    if (success) {
+      this.initialized = true;
+      logger.info('DingTalk-Bot', 'Claude CLI pre-initialization complete');
+    } else {
+      logger.error('DingTalk-Bot', 'Claude CLI pre-initialization failed');
+    }
+
+    return success;
   }
 
   isInitialized(): boolean {

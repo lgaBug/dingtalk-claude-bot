@@ -71,8 +71,12 @@ async function main() {
 
   // Bot 启动后初始化 Claude CLI 进程
   console.log('Initializing Claude CLI (this takes ~5 seconds)...');
-  await bot.preInitializeClaude();
-  console.log('Claude CLI initialized, ready to serve requests');
+  const initSuccess = await bot.preInitializeClaude();
+  if (!initSuccess) {
+    console.log('WARNING: Claude CLI initialization failed, bot may not respond properly');
+  } else {
+    console.log('Claude CLI initialized, ready to serve requests');
+  }
 
   const app = createServer(bot);
 
@@ -84,26 +88,30 @@ async function main() {
   const shutdown = async () => {
     console.log('=== Bot Shutting Down ===');
 
-    // 更新 session 状态并关闭
+    // 1. 标记所有会话为 stopping 状态
     claudeClient.markAllSessionsStopping();
 
-    // 等待一小段时间让进程处理
-    await new Promise(resolve => setTimeout(resolve, 1000));
+    // 2. 关闭所有 Claude 进程并等待其真正退出
+    await claudeClient.closeAllAsync();
 
-    // 关闭所有 Claude 进程
-    claudeClient.closeAll();
-
-    // 读取当前 session 并标记为 stopped
+    // 3. 读取当前 session 并标记为 stopped
     const currentSessions = readSessions();
     writeSessions(currentSessions.map(s => ({ ...s, status: 'stopped' })));
 
+    // 4. 关闭 DingTalk 连接
+    dingtalkClient.close();
+
+    // 5. 关闭 HTTP 服务器
     server.close(() => {
       console.log('Server closed');
       process.exit(0);
     });
 
-    // 强制退出
-    setTimeout(() => process.exit(1), 5000);
+    // 6. 强制退出（如果 5 秒后服务器还没关闭）
+    setTimeout(() => {
+      console.log('Forced exit after timeout');
+      process.exit(1);
+    }, 5000);
   };
 
   process.on('SIGTERM', shutdown);
