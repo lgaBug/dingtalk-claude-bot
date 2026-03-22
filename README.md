@@ -1,89 +1,91 @@
 # DingTalk Claude Bot
 
-A DingTalk bot powered by Claude Code CLI. Receives messages via DingTalk's streaming API and responds using Claude Code in real-time.
+基于 Claude Code CLI 的钉钉机器人。通过钉钉流式 API 接收消息，并实时响应。
 
-## Features
+[English](./README_EN.md)
 
-- Real-time streaming responses via DingTalk interactive cards
-- Persistent conversation history within sessions
-- WebSocket connection to DingTalk streaming API
-- Support for multiple concurrent conversations
+## 功能特性
 
-## Prerequisites
+- 通过钉钉互动卡片实时流式响应
+- 会话内持久化对话历史
+- WebSocket 连接钉钉流式 API
+- 支持多并发对话
+
+## 环境要求
 
 - Node.js 18+
 - Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)
-- A DingTalk bot application with streaming API enabled
+- 已启用流式 API 的钉钉机器人应用
 
-## Setup
+## 快速开始
 
-1. **Clone the repository**
+1. **克隆仓库**
    ```bash
-   git clone <your-repo-url>
+   git clone <你的仓库地址>
    cd dingtalk-claude-bot
    ```
 
-2. **Install dependencies**
+2. **安装依赖**
    ```bash
    npm install
    ```
 
-3. **Configure environment variables**
+3. **配置环境变量**
    ```bash
    cp .env.example .env
-   # Edit .env with your DingTalk credentials:
-   # DINGTALK_CLIENT_ID=your_client_id
-   # DINGTALK_CLIENT_SECRET=your_client_secret
+   # 编辑 .env 填入你的钉钉凭证：
+   # DINGTALK_CLIENT_ID=你的_client_id
+   # DINGTALK_CLIENT_SECRET=你的_client_secret
    ```
 
-4. **Build the project**
+4. **构建项目**
    ```bash
    npm run build
    ```
 
-5. **Start the bot**
+5. **启动机器人**
    ```bash
    npm start
    ```
 
-## Development
+## 开发模式
 
 ```bash
-npm run dev  # Run with hot-reload using tsx watch
+npm run dev  # 使用 tsx watch 热重载
 ```
 
-## How It Works
+## 工作原理
 
-1. Bot connects to DingTalk via WebSocket streaming API
-2. User sends message to DingTalk bot
-3. Bot creates/uses a persistent Claude Code CLI process
-4. Claude Code streams response back
-5. Bot updates DingTalk interactive card in real-time
-6. Card marked as complete when response finishes
+1. 机器人通过 WebSocket 流式 API 连接钉钉
+2. 用户向钉钉机器人发送消息
+3. 机器人创建/复用持久化的 Claude Code CLI 进程
+4. Claude Code 流式返回响应
+5. 机器人实时更新钉钉互动卡片
+6. 响应完成后卡片标记为结束
 
-## Project Structure
+## 项目结构
 
 ```
 src/
-├── index.ts              # Entry point, server setup
-├── config.ts             # Environment configuration
-├── logger.ts             # Structured logging
+├── index.ts              # 入口点，服务器配置
+├── config.ts             # 环境配置
+├── logger.ts             # 结构化日志
 ├── claude/
-│   └── client.ts        # Claude Code CLI integration
+│   └── client.ts        # Claude Code CLI 集成
 └── dingtalk/
-    ├── bot.ts           # Message routing & conversation state
-    ├── client.ts        # DingTalk API client
-    └── card.ts          # Card message templates
+    ├── bot.ts           # 消息路由和会话状态
+    ├── client.ts        # 钉钉 API 客户端
+    └── card.ts          # 卡片消息模板
 ```
 
-## Configuration
+## 配置项
 
-| Variable | Description | Required |
+| 变量 | 描述 | 必填 |
 |----------|-------------|----------|
-| `DINGTALK_CLIENT_ID` | DingTalk app client ID | Yes |
-| `DINGTALK_CLIENT_SECRET` | DingTalk app client secret | Yes |
-| `PORT` | Server port (default: 3000) | No |
+| `DINGTALK_CLIENT_ID` | 钉钉应用 Client ID | 是 |
+| `DINGTALK_CLIENT_SECRET` | 钉钉应用 Client Secret | 是 |
+| `PORT` | 服务器端口（默认：3000） | 否 |
 
-## License
+## 开源协议
 
 MIT
