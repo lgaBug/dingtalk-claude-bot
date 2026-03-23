@@ -12,8 +12,7 @@
     "axios": "^1.13.6",
     "dingtalk-stream": "^2.1.5",
     "dotenv": "^16.4.5",
-    "express": "^4.21.0",
-    "node-pty": "^1.1.0"
+    "express": "^4.21.0"
   },
   "devDependencies": {
     "@types/express": "^5.0.0",

@@ -11,12 +11,16 @@ interface StreamClientOptions {
 // AI 卡片模板 ID（从环境变量读取）
 const CARD_TEMPLATE_ID = process.env.DINGTALK_CARD_TEMPLATE_ID || 'ed5262bd-f1d2-4def-ae1e-249c6cb5643a.schema';
 
+// Access Token 缓存
+let cachedAccessToken: string | null = null;
+let tokenExpiresAt: number = 0;
+
 export class DingTalkClient {
   private clientId: string;
   private clientSecret: string;
   private bot?: DingTalkBot;
   private dwClient?: DWClient;
-  private cardInstances: Map<string, { outTrackId: string; guid: string }> = new Map(); // conversationId -> { outTrackId, guid }
+  private cardInstances: Map<string, { outTrackId: string; guid: string }> = new Map();
 
   constructor(options: StreamClientOptions) {
     this.clientId = options.botToken;
@@ -27,7 +31,6 @@ export class DingTalkClient {
     this.bot = bot;
   }
 
-  // 关闭 DingTalk 连接
   close(): void {
     if (this.dwClient) {
       logger.info('DingTalk-Client', 'Closing DingTalk stream connection');
@@ -69,14 +72,11 @@ export class DingTalkClient {
       debug: true,
     });
 
-    // Register callback listener for bot messages
     client.registerCallbackListener('/v1.0/im/bot/messages/get', (event: DWClientDownStream) => {
       this.handleCallback(event);
-      // Return acknowledgment immediately to prevent retry
       return { status: EventAck.SUCCESS };
     });
 
-    // Register for all other events
     client.registerAllEventListener((event: DWClientDownStream) => {
       logger.debug('DingTalk-Client', 'System event received', { type: event.type, topic: event.headers.topic });
       return { status: EventAck.SUCCESS };
@@ -114,7 +114,6 @@ export class DingTalkClient {
       const text = data.text?.content || data.text;
       const createAt = data.createAt;
 
-      // 同步检查重复 - 在返回 SUCCESS 之前就检查
       if (msgUid && this.bot.shouldSkipMessage(msgUid, createAt)) {
         logger.warn('DingTalk-Client', 'Duplicate message, skipping', { msgUid, createAt });
         return;
@@ -145,7 +144,6 @@ export class DingTalkClient {
       });
 
       if (msgType === 'text' && text) {
-        // 异步处理消息，但不等待完成
         this.bot.handleMessage(
           conversationId,
           senderNick,
@@ -163,14 +161,24 @@ export class DingTalkClient {
     }
   }
 
-  // 获取 access token
+  // 获取 access token（带缓存，提前 5 分钟刷新）
   private async getAccessToken(): Promise<string | null> {
+    const now = Date.now();
+    if (cachedAccessToken && now < tokenExpiresAt) {
+      return cachedAccessToken;
+    }
+
     try {
       const response = await axios.get(
         'https://oapi.dingtalk.com/gettoken',
         { params: { appkey: this.clientId, appsecret: this.clientSecret } }
       );
-      return response.data.access_token;
+      cachedAccessToken = response.data.access_token;
+      // 钉钉 token 有效期 7200 秒，提前 5 分钟刷新
+      const expiresIn = (response.data.expires_in || 7200) - 300;
+      tokenExpiresAt = now + expiresIn * 1000;
+      logger.info('DingTalk-Client', 'Access token refreshed', { expiresIn });
+      return cachedAccessToken;
     } catch (error: any) {
       logger.error('DingTalk-Client', 'Failed to get access token', { error: error.message });
       return null;
@@ -182,8 +190,8 @@ export class DingTalkClient {
     const accessToken = await this.getAccessToken();
     if (!accessToken) return null;
 
-    const outTrackId = `claude_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const guid = `claude_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const outTrackId = `claude_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
+    const guid = `claude_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
     const spaceId = `dtv1.card//im_robot.${senderStaffId}`;
 
     logger.info('DingTalk-Client', 'Creating stream card', { outTrackId, guid, spaceId });
@@ -223,7 +231,6 @@ export class DingTalkClient {
 
       logger.info('DingTalk-Client', 'Card created', { result: JSON.stringify(response.data).substring(0, 200) });
 
-      // 保存 outTrackId 和 guid
       this.cardInstances.set(conversationId, { outTrackId, guid });
 
       return outTrackId;
@@ -265,7 +272,7 @@ export class DingTalkClient {
           guid: guid,
           key: 'content',
           content: content,
-          isFull: true,  // 始终设为 true，确保每次都完整渲染
+          isFull: true,
           isFinalize: isFinal,
           isError: false,
         },

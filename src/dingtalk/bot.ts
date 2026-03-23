@@ -2,6 +2,10 @@ import type { DingTalkClient } from './client.js';
 import type { ClaudeClient } from '../claude/client.js';
 import { logger } from '../logger.js';
 
+const MAX_HISTORY_MESSAGES = 50; // 每个会话最多保留的消息数
+const DEDUP_CLEANUP_INTERVAL = 5 * 60 * 1000; // 5 分钟清理一次去重 Map
+const DEDUP_TTL = 2 * 60 * 1000; // 消息去重有效期 2 分钟
+
 interface Message {
   role: 'user' | 'assistant';
   content: string;
@@ -22,20 +26,44 @@ export class DingTalkBot {
   private conversations: Map<string, Conversation> = new Map();
   private processingMessages: Map<string, number> = new Map(); // msgUid -> timestamp
   private initialized: boolean = false;
+  private dedupCleanupTimer?: ReturnType<typeof setInterval>;
 
   constructor(dingtalk: DingTalkClient, claude: ClaudeClient) {
     this.dingtalk = dingtalk;
     this.claude = claude;
+
+    // 定期清理过期的去重记录
+    this.dedupCleanupTimer = setInterval(() => {
+      this.cleanupProcessingMessages();
+    }, DEDUP_CLEANUP_INTERVAL);
   }
 
-  // 预初始化 Claude CLI，等待完成后才接收消息
+  // 清理过期的去重记录
+  private cleanupProcessingMessages(): void {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [msgUid, timestamp] of this.processingMessages) {
+      if (now - timestamp > DEDUP_TTL) {
+        this.processingMessages.delete(msgUid);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      logger.debug('DingTalk-Bot', 'Cleaned up dedup entries', { cleaned, remaining: this.processingMessages.size });
+    }
+  }
+
+  destroy(): void {
+    if (this.dedupCleanupTimer) {
+      clearInterval(this.dedupCleanupTimer);
+    }
+  }
+
   async preInitializeClaude(): Promise<boolean> {
     if (this.initialized) return true;
 
     logger.info('DingTalk-Bot', 'Pre-initializing Claude CLI...');
 
-    // 使用固定的 'shared' sessionId 来预初始化
-    // 这样所有后续请求都会复用这个进程
     const success = await this.claude.createSharedProcess();
 
     if (success) {
@@ -68,10 +96,7 @@ export class DingTalkBot {
       senderStaffId,
       textLength: text.length,
       textPreview: text.substring(0, 100),
-      conversationType: 'private',
     });
-
-    // msgUid 已经在 handleCallback 中通过 shouldSkipMessage 添加
 
     try {
       let conversation = this.conversations.get(conversationId);
@@ -82,11 +107,6 @@ export class DingTalkBot {
           messages: [],
         };
         this.conversations.set(conversationId, conversation);
-      } else {
-        logger.debug('DingTalk-Bot', 'Existing conversation found', {
-          conversationId,
-          messageCount: conversation.messages.length,
-        });
       }
 
       const userMessage: Message = {
@@ -96,27 +116,28 @@ export class DingTalkBot {
         timestamp: Date.now(),
       };
 
-      conversation!.messages.push(userMessage);
-      logger.debug('DingTalk-Bot', 'User message added to conversation', {
-        conversationId,
-        totalMessages: conversation!.messages.length,
-      });
+      conversation.messages.push(userMessage);
 
-      // 创建流式 AI 卡片 (每次消息都创建新卡片，因为旧卡片可能已被用户关闭)
+      // 限制会话历史长度
+      if (conversation.messages.length > MAX_HISTORY_MESSAGES) {
+        conversation.messages = conversation.messages.slice(-MAX_HISTORY_MESSAGES);
+      }
+
+      // 创建流式 AI 卡片
       let outTrackId: string | undefined = undefined;
       if (senderStaffId && robotCode) {
         logger.info('DingTalk-Bot', 'Creating stream card', { conversationId, senderStaffId });
         const newOutTrackId = await this.dingtalk.createStreamCard(conversationId, robotCode, senderStaffId, text);
         if (newOutTrackId) {
           outTrackId = newOutTrackId;
-          conversation!.outTrackId = newOutTrackId;
+          conversation.outTrackId = newOutTrackId;
           logger.info('DingTalk-Bot', 'Stream card created', { conversationId, outTrackId });
         }
       }
 
       logger.info('DingTalk-Bot', '>>> Calling Claude Code', {
         conversationId,
-        messageCount: conversation!.messages.length,
+        messageCount: conversation.messages.length,
         latestMessage: text.substring(0, 100),
       });
 
@@ -124,13 +145,9 @@ export class DingTalkBot {
       let chunkCount = 0;
       let isComplete = false;
 
-      logger.info('DingTalk-Bot', '>>> Claude Code streaming started', { conversationId });
-
+      // Claude CLI 通过 session-id 维护上下文，只发送最新消息
       await this.claude.streamMessage({
-        messages: conversation!.messages.map((m) => ({
-          role: m.role,
-          content: m.content,
-        })),
+        messages: [{ role: 'user', content: text }],
         onChunk: async (chunk: string) => {
           if (isComplete) return;
 
@@ -144,7 +161,6 @@ export class DingTalkBot {
             totalResponseLength: fullResponse.length,
           });
 
-          // 每次都更新，确保内容实时同步到钉钉
           if (outTrackId) {
             await this.dingtalk.updateCard(conversationId, fullResponse, false);
           }
@@ -166,12 +182,11 @@ export class DingTalkBot {
             timestamp: Date.now(),
           });
 
-          logger.debug('DingTalk-Bot', 'Assistant response added to conversation', {
-            conversationId,
-            totalMessages: conversation!.messages.length,
-          });
+          // 限制会话历史长度
+          if (conversation!.messages.length > MAX_HISTORY_MESSAGES) {
+            conversation!.messages = conversation!.messages.slice(-MAX_HISTORY_MESSAGES);
+          }
 
-          // 更新卡片为完成状态
           if (outTrackId) {
             await this.dingtalk.updateCard(conversationId, fullResponse, true);
           }
@@ -189,7 +204,7 @@ export class DingTalkBot {
         },
       }, conversationId);
     } finally {
-      // 不再删除 msgUid，基于时间去重
+      // 基于时间去重，不删除 msgUid
     }
   }
 
@@ -198,23 +213,13 @@ export class DingTalkBot {
     this.conversations.delete(conversationId);
   }
 
-  isProcessing(msgUid: string): boolean {
-    return this.processingMessages.has(msgUid);
-  }
-
-  addProcessing(msgUid: string): void {
-    this.processingMessages.set(msgUid, Date.now());
-  }
-
-  // 同步检查是否应该跳过消息（先添加到map再检查）
   shouldSkipMessage(msgUid: string, createAt: number): boolean {
     if (!msgUid) return false;
     const now = Date.now();
     const last = this.processingMessages.get(msgUid);
-    if (last && (now - last) < 120000) {
-      return true; // 已经在处理中
+    if (last && (now - last) < DEDUP_TTL) {
+      return true;
     }
-    // 先添加到 map，再返回 false（开始处理）
     this.processingMessages.set(msgUid, now);
     return false;
   }

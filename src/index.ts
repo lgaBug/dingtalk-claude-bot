@@ -6,13 +6,14 @@ import { ClaudeClient } from './claude/client.js';
 import { spawn } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import * as os from 'os';
 
 const SESSION_FILE = path.join(process.cwd(), '.claude_sessions');
 
 interface SessionInfo {
   sessionId: string;
   pid: number;
-  status: 'running' | 'stopped';
+  status: 'running' | 'stopping' | 'stopped';
 }
 
 function readSessions(): SessionInfo[] {
@@ -33,27 +34,29 @@ function writeSessions(sessions: SessionInfo[]): void {
 async function main() {
   console.log('=== Bot Starting ===');
 
-  // 读取之前记录的 session
   const sessions = readSessions();
   console.log('Previous sessions:', sessions);
 
   // 清理之前标记为 running 的进程
+  const isWindows = os.platform() === 'win32';
   const runningSessions = sessions.filter(s => s.status === 'running');
   for (const session of runningSessions) {
     console.log(`Killing previous Claude process: PID=${session.pid}, sessionId=${session.sessionId}`);
     try {
-      spawn('taskkill', ['/F', '/PID', session.pid.toString()], { shell: true });
+      if (isWindows) {
+        spawn('taskkill', ['/F', '/PID', session.pid.toString()], { shell: true });
+      } else {
+        process.kill(session.pid, 'SIGKILL');
+      }
     } catch (e) {
       console.log('Failed to kill process:', e);
     }
   }
 
-  // 更新所有 session 状态为 stopped
   if (sessions.length > 0) {
-    writeSessions(sessions.map(s => ({ ...s, status: 'stopped' })));
+    writeSessions(sessions.map(s => ({ ...s, status: 'stopped' as const })));
   }
 
-  // 等待进程清理
   await new Promise(resolve => setTimeout(resolve, 1000));
 
   const claudeClient = new ClaudeClient();
@@ -69,7 +72,6 @@ async function main() {
 
   await dingtalkClient.startStream();
 
-  // Bot 启动后初始化 Claude CLI 进程
   console.log('Initializing Claude CLI (this takes ~5 seconds)...');
   const initSuccess = await bot.preInitializeClaude();
   if (!initSuccess) {
@@ -84,30 +86,23 @@ async function main() {
     console.log(`Server running on port ${config.port}`);
   });
 
-  // 优雅关闭
   const shutdown = async () => {
     console.log('=== Bot Shutting Down ===');
 
-    // 1. 标记所有会话为 stopping 状态
     claudeClient.markAllSessionsStopping();
-
-    // 2. 关闭所有 Claude 进程并等待其真正退出
     await claudeClient.closeAllAsync();
 
-    // 3. 读取当前 session 并标记为 stopped
     const currentSessions = readSessions();
-    writeSessions(currentSessions.map(s => ({ ...s, status: 'stopped' })));
+    writeSessions(currentSessions.map(s => ({ ...s, status: 'stopped' as const })));
 
-    // 4. 关闭 DingTalk 连接
     dingtalkClient.close();
+    bot.destroy();
 
-    // 5. 关闭 HTTP 服务器
     server.close(() => {
       console.log('Server closed');
       process.exit(0);
     });
 
-    // 6. 强制退出（如果 5 秒后服务器还没关闭）
     setTimeout(() => {
       console.log('Forced exit after timeout');
       process.exit(1);
