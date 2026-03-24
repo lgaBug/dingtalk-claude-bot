@@ -8,7 +8,8 @@ const DEDUP_TTL = 2 * 60 * 1000;
 
 // 卡片更新配置
 const CARD_UPDATE_INTERVAL = 500;    // 防抖间隔：500ms
-const MAX_CARD_CONTENT = 8000;       // 卡片内容最大字符数
+const MAX_CARD_CONTENT = 8000;       // 单张卡片内容最大字符数
+const CARD_SPLIT_THRESHOLD = 6000;   // 超过此长度时考虑分卡（留余量给截断提示）
 
 interface Message {
   role: 'user' | 'assistant';
@@ -64,14 +65,14 @@ export class DingTalkBot {
   async preInitializeClaude(): Promise<boolean> {
     if (this.initialized) return true;
 
-    logger.info('DingTalk-Bot', 'Pre-initializing Claude CLI...');
-    const success = await this.claude.createSharedProcess();
+    logger.info('DingTalk-Bot', 'Connecting to Claude proxy...');
+    const success = await this.claude.connect();
 
     if (success) {
       this.initialized = true;
-      logger.info('DingTalk-Bot', 'Claude CLI pre-initialization complete');
+      logger.info('DingTalk-Bot', 'Claude proxy connection established');
     } else {
-      logger.error('DingTalk-Bot', 'Claude CLI pre-initialization failed');
+      logger.error('DingTalk-Bot', 'Claude proxy connection failed');
     }
 
     return success;
@@ -101,7 +102,8 @@ export class DingTalkBot {
     msgUid?: string,
     senderStaffId?: string,
     sessionWebhook?: string,
-    robotCode?: string
+    robotCode?: string,
+    conversationType?: string
   ) {
     logger.info('DingTalk-Bot', '=== New Message Received ===', {
       conversationId,
@@ -159,12 +161,71 @@ export class DingTalkBot {
       let updateTimer: ReturnType<typeof setInterval> | null = null;
       let isUpdating = false;     // 防止并发更新
 
+      // 多卡片支持：当内容超出单张卡片限制时，自动创建后续卡片
+      let cardContentOffset = 0;  // 当前卡片对应 fullResponse 的起始位置
+      let cardPartIndex = 0;      // 当前卡片编号（0-based）
+      let isSplitting = false;    // 防止并发分卡
+
+      // 获取当前卡片的内容
+      const getCurrentCardContent = () => fullResponse.substring(cardContentOffset);
+
+      // 分卡：finalize 当前卡片，创建新卡片
+      const splitCard = async () => {
+        if (isSplitting || !outTrackId || !robotCode || !senderStaffId) return;
+        isSplitting = true;
+        try {
+          // Finalize 当前卡片（保留尾部内容 + 续接提示）
+          const currentContent = getCurrentCardContent();
+          const truncated = this.truncateCardContent(currentContent);
+          const partLabel = cardPartIndex > 0 ? ` (Part ${cardPartIndex + 1})` : '';
+          const finalContent = truncated + `\n\n---\n*↓ 内容继续到下一张卡片${partLabel}...*`;
+          await this.dingtalk.updateCard(conversationId, finalContent, true);
+
+          logger.info('DingTalk-Bot', 'Card split: finalized current card', {
+            conversationId,
+            part: cardPartIndex + 1,
+            contentLength: currentContent.length,
+          });
+
+          // 创建新卡片
+          cardPartIndex++;
+          const newOutTrackId = await this.dingtalk.createStreamCard(
+            conversationId, robotCode, senderStaffId,
+            `(Part ${cardPartIndex + 1})`
+          );
+          if (newOutTrackId) {
+            outTrackId = newOutTrackId;
+            conversation!.outTrackId = newOutTrackId;
+            cardContentOffset = fullResponse.length; // 新卡片从当前位置开始
+            lastSentContent = '';
+
+            logger.info('DingTalk-Bot', 'Card split: new card created', {
+              conversationId,
+              part: cardPartIndex + 1,
+              outTrackId: newOutTrackId,
+            });
+          }
+        } catch (e: any) {
+          logger.error('DingTalk-Bot', 'Card split failed', { error: e.message });
+        } finally {
+          isSplitting = false;
+        }
+      };
+
       // 防抖卡片更新：每 500ms 检查内容是否变化，变化则更新
       const startCardUpdater = () => {
         if (!outTrackId) return;
         updateTimer = setInterval(async () => {
-          if (isUpdating || isComplete) return;
-          const currentContent = this.truncateCardContent(fullResponse);
+          if (isUpdating || isComplete || isSplitting) return;
+
+          // 检查是否需要分卡
+          const cardContent = getCurrentCardContent();
+          if (cardContent.length > CARD_SPLIT_THRESHOLD && robotCode && senderStaffId) {
+            await splitCard();
+            return;
+          }
+
+          const currentContent = this.truncateCardContent(cardContent);
           if (currentContent === lastSentContent) return;
 
           isUpdating = true;
@@ -173,6 +234,7 @@ export class DingTalkBot {
             lastSentContent = currentContent;
             logger.debug('DingTalk-Bot', 'Card updated (debounced)', {
               conversationId,
+              part: cardPartIndex + 1,
               contentLength: currentContent.length,
             });
           } catch (e: any) {
@@ -189,8 +251,8 @@ export class DingTalkBot {
           clearInterval(updateTimer);
           updateTimer = null;
         }
-        // 等待进行中的更新完成
-        while (isUpdating) {
+        // 等待进行中的更新/分卡完成
+        while (isUpdating || isSplitting) {
           await new Promise(resolve => setTimeout(resolve, 50));
         }
       };
@@ -204,6 +266,25 @@ export class DingTalkBot {
           // 只累积文本，不直接调 API（由定时器统一更新）
           fullResponse += chunk;
         },
+        onImage: async (filePath: string) => {
+          if (!robotCode || !senderStaffId) {
+            logger.warn('DingTalk-Bot', 'Missing robotCode or senderStaffId, cannot send image', { filePath });
+            return;
+          }
+          logger.info('DingTalk-Bot', 'Sending image to DingTalk', { conversationId, filePath, conversationType });
+          const success = await this.dingtalk.sendImageToChat(
+            filePath,
+            robotCode,
+            conversationType || '1',
+            conversationId,
+            senderStaffId
+          );
+          if (success) {
+            logger.info('DingTalk-Bot', 'Image sent successfully', { conversationId, filePath });
+          } else {
+            logger.error('DingTalk-Bot', 'Failed to send image', { conversationId, filePath });
+          }
+        },
         onComplete: async () => {
           if (isComplete) return;
           isComplete = true;
@@ -211,6 +292,7 @@ export class DingTalkBot {
           logger.info('DingTalk-Bot', '>>> Claude Code streaming completed', {
             conversationId,
             totalResponseLength: fullResponse.length,
+            totalCards: cardPartIndex + 1,
             responsePreview: fullResponse.substring(0, 100),
           });
 
@@ -227,10 +309,16 @@ export class DingTalkBot {
           // 停止定时器，做最终卡片更新
           await stopCardUpdater();
           if (outTrackId) {
-            const finalContent = this.truncateCardContent(fullResponse);
+            const finalCardContent = getCurrentCardContent();
+            const finalContent = this.truncateCardContent(finalCardContent);
             try {
               await this.dingtalk.updateCard(conversationId, finalContent, true);
-              logger.info('DingTalk-Bot', 'Card finalized', { conversationId, contentLength: finalContent.length });
+              logger.info('DingTalk-Bot', 'Card finalized', {
+                conversationId,
+                part: cardPartIndex + 1,
+                contentLength: finalContent.length,
+                totalResponseLength: fullResponse.length,
+              });
             } catch (e: any) {
               logger.error('DingTalk-Bot', 'Card finalize failed', { error: e.message });
             }
@@ -246,8 +334,9 @@ export class DingTalkBot {
           });
 
           if (outTrackId) {
-            const errorContent = fullResponse
-              ? fullResponse + `\n\n---\n\n❌ **Error**: ${error.message}`
+            const cardContent = getCurrentCardContent();
+            const errorContent = cardContent
+              ? cardContent + `\n\n---\n\n❌ **Error**: ${error.message}`
               : `❌ **Error**: ${error.message}`;
             try {
               await this.dingtalk.updateCard(conversationId, this.truncateCardContent(errorContent), true);

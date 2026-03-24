@@ -39,8 +39,10 @@ Changed port configuration to read from environment variable, defaults to 3000.
 
 - **Full visibility** — Tool calls (Read, Bash, Edit, Write, Grep, etc.) displayed in real-time
 - **Streaming responses** — DingTalk interactive cards update live, no waiting for full response
-- **Multi-turn conversations** — Context maintained via Claude CLI `--session-id`
-- **Concurrent users** — Shared Claude CLI process serves multiple conversations
+- **Multi-card pagination** — Long task outputs automatically split across multiple cards
+- **Multi-turn conversations** — Context maintained via fixed Session ID, survives bot restarts
+- **Proxy architecture** — Claude CLI runs independently; bot restarts don't affect it
+- **Image support** — Auto-detects image files produced by Claude tools and sends them to DingTalk
 - **Message deduplication** — Handles DingTalk's At-Least-Once delivery semantics
 - **Cross-platform** — Supports Windows (Git Bash) and Linux/macOS
 
@@ -62,7 +64,7 @@ npm install
 
 # 3. Configure environment
 cp .env.example .env
-# Edit .env with your DingTalk credentials
+# Edit .env with your DingTalk credentials and Claude process name
 
 # 4. Development mode
 npm run dev
@@ -73,23 +75,26 @@ npm run build && npm start
 
 ## Architecture
 
+The bot communicates with an independent Proxy process via Named Pipe. The Proxy manages the Claude CLI lifecycle. The bot can restart freely without affecting the running Claude CLI.
+
 ```
-┌──────────┐   WebSocket    ┌──────────┐  stdin/stdout  ┌──────────┐
-│ DingTalk │ ←───────────→ │ DingTalk │ ←────────────→ │  Claude  │
-│   User   │  Stream API    │  Client  │  stream-json   │ Code CLI │
-└──────────┘               └────┬─────┘               └──────────┘
-                                │
-                     updateCard() ← real-time per event
-                                │
-                         ┌──────┴─────┐
-                         │  DingTalk  │
-                         │   Card     │
-                         └────────────┘
+                          Named Pipe
+┌──────────┐  WebSocket  ┌──────┐ (\\.\pipe\...)  ┌───────┐  stdio   ┌──────────┐
+│ DingTalk │ ←─────────→ │ Bot  │ ←────────────→ │ Proxy │ ←──────→ │  Claude  │
+│   User   │  Stream API  │      │                │(long-  │          │ Code CLI │
+└──────────┘             └──┬───┘                │lived)  │          └──────────┘
+                            │                    └───────┘
+                 updateCard()                        ↑
+                            │                   detached process
+                     ┌──────┴──────┐            auto-reconnects
+                     │  DingTalk   │            on bot restart
+                     │    Card     │
+                     └─────────────┘
 ```
 
 ### Event Processing
 
-Claude CLI outputs `stream-json` events. The bot parses each event and formats it as Markdown for the card:
+Claude CLI outputs `stream-json` events. The Proxy relays them to the bot, which parses and formats each event as Markdown for the card:
 
 | CLI Event | Card Display |
 |-----------|-------------|
@@ -108,17 +113,22 @@ src/
 ├── server/
 │   └── express.ts        # Express health check
 ├── claude/
-│   └── client.ts         # Claude CLI process management, event parsing, formatting
+│   ├── client.ts         # Proxy connection, event parsing, formatting
+│   └── proxy.ts          # Standalone proxy process managing Claude CLI
 └── dingtalk/
-    ├── bot.ts            # Message routing, session management, deduplication
+    ├── bot.ts            # Message routing, session management, dedup, multi-card
     └── client.ts         # WebSocket connection, card create/update, token cache
 ```
 
 ### Key Design Decisions
 
-**Shared process** — A single Claude CLI subprocess is created on startup and shared across conversations. Falls back to per-conversation processes on session conflicts.
+**Proxy architecture** — Claude CLI is managed by an independent Proxy process, communicating with the bot via Named Pipe (Windows) / Unix Socket. On startup, the bot connects to an existing Proxy or creates one. On shutdown, it disconnects without killing the Proxy or Claude CLI.
 
-**Process lifecycle** — `.claude_sessions` file persists process info. Cleans up residual processes on startup; kills process trees and waits for exit on shutdown.
+**Process name matching** — `CLAUDE_PROCESS_NAME` configures the process identifier. The bot only connects to its matching Proxy. Different bot instances can use different names without interference.
+
+**Auto-restart** — The Proxy automatically restarts Claude CLI on crash (exponential backoff, max 5 retries). Counter resets on successful initialization.
+
+**Multi-card pagination** — When a single card's content exceeds the threshold, the current card is finalized and a new card is created to continue output. No content is lost for long-running tasks.
 
 **Token caching** — Access token cached for 2 hours (refreshed 5 minutes early), preventing rate limits from per-update token requests.
 
@@ -132,6 +142,25 @@ src/
 | `DINGTALK_CLIENT_SECRET` | DingTalk app Client Secret | Yes |
 | `DINGTALK_CARD_TEMPLATE_ID` | DingTalk card template ID | No |
 | `PORT` | Server port (default 3000) | No |
+| `CLAUDE_PROCESS_NAME` | Claude CLI process name (default: default) | No |
+
+## Proxy Management
+
+The Proxy runs as an independent detached process. Related files:
+
+| File | Windows Path | Purpose |
+|------|-------------|---------|
+| PID file | `%TEMP%\claude-proxy-<name>.pid` | Proxy process ID |
+| Log file | `%TEMP%\claude-proxy-<name>.log` | Proxy runtime log |
+| Named Pipe | `\\.\pipe\claude-bot-<name>` | IPC communication |
+
+```bash
+# View Proxy logs
+cat "$TEMP/claude-proxy-dingtalk-bot.log"
+
+# Manually stop Proxy (also stops Claude CLI)
+kill $(cat "$TEMP/claude-proxy-dingtalk-bot.pid")
+```
 
 ## License
 
