@@ -46,7 +46,7 @@ async function getAccessToken(clientId: string, clientSecret: string): Promise<s
   return cachedToken!;
 }
 
-async function uploadImage(filePath: string, robotCode: string, accessToken: string): Promise<string> {
+async function uploadImage(filePath: string, accessToken: string): Promise<string> {
   const absolutePath = path.resolve(filePath);
   if (!fs.existsSync(absolutePath)) {
     throw new Error(`File not found: ${absolutePath}`);
@@ -59,22 +59,17 @@ async function uploadImage(filePath: string, robotCode: string, accessToken: str
   }
 
   const form = new FormData();
-  form.append('file', fs.createReadStream(absolutePath), {
+  form.append('media', fs.createReadStream(absolutePath), {
     filename: path.basename(absolutePath),
   });
 
   const response = await axios.post(
-    `https://api.dingtalk.com/v1.0/robot/messageFiles/upload?robotCode=${encodeURIComponent(robotCode)}&type=image`,
+    `https://oapi.dingtalk.com/media/upload?access_token=${accessToken}&type=image`,
     form,
-    {
-      headers: {
-        ...form.getHeaders(),
-        'x-acs-dingtalk-access-token': accessToken,
-      },
-    }
+    { headers: form.getHeaders() }
   );
 
-  const mediaId = response.data.mediaId;
+  const mediaId = response.data.media_id;
   if (!mediaId) {
     throw new Error(`Upload failed: ${JSON.stringify(response.data)}`);
   }
@@ -238,7 +233,7 @@ server.tool(
 
       // 2. Upload image
       const absolutePath = path.resolve(file_path);
-      const mediaId = await uploadImage(absolutePath, resolvedRobotCode, accessToken);
+      const mediaId = await uploadImage(absolutePath, accessToken);
 
       // 3. Send image message
       await sendImageMessage(mediaId, resolvedRobotCode, targetType, targetId, accessToken);

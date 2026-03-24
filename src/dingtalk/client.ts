@@ -383,54 +383,10 @@ export class DingTalkClient {
     const accessToken = await this.getAccessToken();
     if (!accessToken) return false;
 
-    // Step 1: 上传文件到机器人消息文件 API
-    const mediaId = await this.uploadRobotFile(robotCode, filePath, accessToken);
-    if (!mediaId) {
-      logger.warn('DingTalk-Client', 'Robot file upload failed, trying old media API');
-      // fallback 到旧 API
-      const oldMediaId = await this.uploadMedia(filePath, 'image');
-      if (!oldMediaId) return false;
-      return this.sendImageViaRobotApi(oldMediaId, robotCode, conversationType, conversationId, senderStaffId, accessToken);
-    }
+    const mediaId = await this.uploadMedia(filePath, 'image');
+    if (!mediaId) return false;
 
     return this.sendImageViaRobotApi(mediaId, robotCode, conversationType, conversationId, senderStaffId, accessToken);
-  }
-
-  // 上传文件到机器人消息文件 API
-  private async uploadRobotFile(robotCode: string, filePath: string, accessToken: string): Promise<string | null> {
-    if (!fs.existsSync(filePath)) {
-      logger.error('DingTalk-Client', 'File not found', { filePath });
-      return null;
-    }
-
-    try {
-      const form = new FormData();
-      form.append('file', fs.createReadStream(filePath), {
-        filename: path.basename(filePath),
-      });
-
-      const response = await axios.post(
-        `https://api.dingtalk.com/v1.0/robot/messageFiles/upload?robotCode=${encodeURIComponent(robotCode)}&type=image`,
-        form,
-        {
-          headers: {
-            ...form.getHeaders(),
-            'x-acs-dingtalk-access-token': accessToken,
-          }
-        }
-      );
-
-      const mediaId = response.data.mediaId;
-      logger.info('DingTalk-Client', 'Robot file uploaded', { mediaId });
-      return mediaId;
-    } catch (error: any) {
-      logger.error('DingTalk-Client', 'Failed to upload robot file', {
-        error: error.message,
-        status: error.response?.status,
-        data: error.response?.data,
-      });
-      return null;
-    }
   }
 
   // 通过 Robot API 发送图片
