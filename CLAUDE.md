@@ -25,6 +25,7 @@ src/claude/client.ts       # ClaudeClient - proxy connection, event parsing, for
 src/claude/proxy.ts        # Claude Proxy - standalone process managing Claude CLI
 src/config.ts              # Environment variables
 src/logger.ts              # Structured logger (console + file)
+src/mcp/dingtalk-image-server.ts  # MCP Tool Server: send images to DingTalk
 ```
 
 ## Key Design Patterns
@@ -63,6 +64,7 @@ Environment variables (see `.env.example`):
 - `DINGTALK_CARD_TEMPLATE_ID` - DingTalk card template ID (optional)
 - `PORT` - Server port (default 3000)
 - `CLAUDE_PROCESS_NAME` - Claude CLI proxy name for process matching (default: 'default')
+- `DINGTALK_ROBOT_CODE` - DingTalk robot code, required for MCP image tool
 
 ## Proxy Management
 
@@ -71,3 +73,16 @@ Proxy runs as a detached process, survives bot restarts. Useful commands:
 - Proxy log: `%TEMP%/claude-proxy-<name>.log`
 - Named pipe: `\\.\pipe\claude-bot-<name>` (Windows)
 - To manually stop proxy: kill the PID from the PID file
+
+## MCP Image Tool
+
+Standalone MCP Tool Server (`dingtalk_send_image`) for sending images to DingTalk. Can be used by any Claude Code instance.
+
+Register globally:
+```bash
+claude mcp add --global dingtalk-image -- node --import tsx /path/to/src/mcp/dingtalk-image-server.ts
+```
+
+Requires env vars: `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET`, `DINGTALK_ROBOT_CODE`.
+
+When invoked via the Bot, `.dingtalk-context.json` provides the send target automatically.

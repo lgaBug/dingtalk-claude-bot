@@ -1,6 +1,8 @@
 import type { DingTalkClient } from './client.js';
 import type { ClaudeClient } from '../claude/client.js';
 import { logger } from '../logger.js';
+import * as fs from 'fs';
+import * as path from 'path';
 
 const MAX_HISTORY_MESSAGES = 50;
 const DEDUP_CLEANUP_INTERVAL = 5 * 60 * 1000;
@@ -147,6 +149,21 @@ export class DingTalkBot {
           outTrackId = newOutTrackId;
           conversation.outTrackId = newOutTrackId;
           logger.info('DingTalk-Bot', 'Stream card created', { conversationId, outTrackId });
+        }
+      }
+
+      // Write context file for MCP tools (e.g. dingtalk_send_image)
+      if (robotCode && senderStaffId) {
+        try {
+          const contextPath = path.join(process.cwd(), '.dingtalk-context.json');
+          fs.writeFileSync(contextPath, JSON.stringify({
+            conversationId,
+            conversationType: conversationType || '1',
+            senderStaffId,
+            robotCode,
+          }, null, 2));
+        } catch (e: any) {
+          logger.warn('DingTalk-Bot', 'Failed to write context file', { error: e.message });
         }
       }
 

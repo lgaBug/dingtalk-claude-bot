@@ -115,9 +115,11 @@ src/
 ├── claude/
 │   ├── client.ts         # Proxy connection, event parsing, formatting
 │   └── proxy.ts          # Standalone proxy process managing Claude CLI
-└── dingtalk/
-    ├── bot.ts            # Message routing, session management, dedup, multi-card
-    └── client.ts         # WebSocket connection, card create/update, token cache
+├── dingtalk/
+│   ├── bot.ts            # Message routing, session management, dedup, multi-card
+│   └── client.ts         # WebSocket connection, card create/update, token cache
+└── mcp/
+    └── dingtalk-image-server.ts  # MCP Tool: send images to DingTalk
 ```
 
 ### Key Design Decisions
@@ -161,6 +163,35 @@ cat "$TEMP/claude-proxy-dingtalk-bot.log"
 # Manually stop Proxy (also stops Claude CLI)
 kill $(cat "$TEMP/claude-proxy-dingtalk-bot.pid")
 ```
+
+## MCP Image Tool
+
+The project includes a standalone MCP Tool Server (`dingtalk_send_image`) that lets any Claude Code instance send images directly to DingTalk chats.
+
+### Registration
+
+```bash
+claude mcp add --global dingtalk-image -- node --import tsx /path/to/src/mcp/dingtalk-image-server.ts
+```
+
+### Environment Variables
+
+| Variable | Description | Required |
+|----------|-------------|----------|
+| `DINGTALK_CLIENT_ID` | DingTalk app Client ID | Yes |
+| `DINGTALK_CLIENT_SECRET` | DingTalk app Client Secret | Yes |
+| `DINGTALK_ROBOT_CODE` | DingTalk robot code | Yes |
+| `DINGTALK_IMAGE_TARGET` | Default target, format `user:<staffId>` or `group:<conversationId>` | No |
+
+### Usage
+
+After registration, Claude Code can call it directly:
+
+```
+Please use the dingtalk_send_image tool to send ./output/chart.png to DingTalk
+```
+
+When triggered via the Bot, the Bot automatically writes `.dingtalk-context.json` so the MCP tool knows where to send images — no manual target needed.
 
 ## License
 

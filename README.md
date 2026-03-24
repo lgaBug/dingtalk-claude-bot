@@ -115,9 +115,11 @@ src/
 ├── claude/
 │   ├── client.ts         # Proxy 连接管理、事件解析、格式化
 │   └── proxy.ts          # 独立代理进程，管理 Claude CLI 生命周期
-└── dingtalk/
-    ├── bot.ts            # 消息路由、会话管理、去重、多卡片分页
-    └── client.ts         # WebSocket 连接、卡片创建/更新、Token 缓存
+├── dingtalk/
+│   ├── bot.ts            # 消息路由、会话管理、去重、多卡片分页
+│   └── client.ts         # WebSocket 连接、卡片创建/更新、Token 缓存
+└── mcp/
+    └── dingtalk-image-server.ts  # MCP Tool：发送图片到钉钉
 ```
 
 ### 关键设计
@@ -161,6 +163,35 @@ cat "$TEMP/claude-proxy-dingtalk-bot.log"
 # 手动停止 Proxy（会同时停止 Claude CLI）
 kill $(cat "$TEMP/claude-proxy-dingtalk-bot.pid")
 ```
+
+## MCP 图片发送工具
+
+项目提供了一个独立的 MCP Tool Server（`dingtalk_send_image`），让任何 Claude Code 实例都能直接发送图片到钉钉聊天。
+
+### 注册
+
+```bash
+claude mcp add --global dingtalk-image -- node --import tsx /path/to/src/mcp/dingtalk-image-server.ts
+```
+
+### 环境变量
+
+| 变量 | 描述 | 必填 |
+|------|------|------|
+| `DINGTALK_CLIENT_ID` | 钉钉应用 Client ID | 是 |
+| `DINGTALK_CLIENT_SECRET` | 钉钉应用 Client Secret | 是 |
+| `DINGTALK_ROBOT_CODE` | 钉钉机器人 Code | 是 |
+| `DINGTALK_IMAGE_TARGET` | 默认发送目标，格式 `user:<staffId>` 或 `group:<conversationId>` | 否 |
+
+### 使用方式
+
+注册后，Claude Code 可直接调用：
+
+```
+请使用 dingtalk_send_image 工具把 ./output/chart.png 发送到钉钉
+```
+
+当从 Bot 触发时，Bot 会自动写入 `.dingtalk-context.json` 文件，MCP 工具读取该文件确定发送目标，无需手动指定 target。
 
 ## License
 

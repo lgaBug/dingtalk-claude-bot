@@ -1,4 +1,7 @@
 import axios from 'axios';
+import fs from 'fs';
+import path from 'path';
+import FormData from 'form-data';
 import { DWClient, EventAck, type DWClientDownStream } from 'dingtalk-stream';
 import type { DingTalkBot } from './bot.js';
 import { logger } from '../logger.js';
@@ -126,6 +129,7 @@ export class DingTalkClient {
       });
 
       const conversationId = data.conversationId;
+      const conversationType = data.conversationType; // "1" = 1:1, "2" = group
       const senderNick = data.senderNick;
       const senderStaffId = data.senderStaffId;
       const chatbotUserId = data.chatbotUserId;
@@ -134,6 +138,7 @@ export class DingTalkClient {
 
       logger.info('DingTalk-Client', '>>> Received message', {
         conversationId,
+        conversationType,
         senderNick,
         msgType,
         textPreview: text?.substring(0, 50),
@@ -151,7 +156,8 @@ export class DingTalkClient {
           msgUid,
           senderStaffId,
           sessionWebhook,
-          robotCode
+          robotCode,
+          conversationType
         ).catch((err) => {
           logger.error('DingTalk-Client', 'Handle message error', { error: err.message });
         });
@@ -323,6 +329,168 @@ export class DingTalkClient {
         error: error.message,
         status: error.response?.status,
       });
+    }
+  }
+
+  // 上传媒体文件到钉钉，返回 mediaId
+  async uploadMedia(filePath: string, type: 'image' | 'voice' | 'video' | 'file' = 'image'): Promise<string | null> {
+    const accessToken = await this.getAccessToken();
+    if (!accessToken) return null;
+
+    if (!fs.existsSync(filePath)) {
+      logger.error('DingTalk-Client', 'File not found', { filePath });
+      return null;
+    }
+
+    try {
+      const form = new FormData();
+      form.append('media', fs.createReadStream(filePath), {
+        filename: path.basename(filePath),
+      });
+      form.append('type', type);
+
+      const response = await axios.post(
+        `https://oapi.dingtalk.com/media/upload?access_token=${accessToken}&type=${type}`,
+        form,
+        { headers: form.getHeaders() }
+      );
+
+      if (response.data.errcode === 0) {
+        logger.info('DingTalk-Client', 'Media uploaded', { mediaId: response.data.media_id, type });
+        return response.data.media_id;
+      } else {
+        logger.error('DingTalk-Client', 'Media upload failed', { error: response.data });
+        return null;
+      }
+    } catch (error: any) {
+      logger.error('DingTalk-Client', 'Failed to upload media', {
+        error: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      return null;
+    }
+  }
+
+  // 通过 Robot API 发送图片消息（支持单聊和群聊）
+  async sendImageToChat(
+    filePath: string,
+    robotCode: string,
+    conversationType: string,
+    conversationId: string,
+    senderStaffId: string
+  ): Promise<boolean> {
+    const accessToken = await this.getAccessToken();
+    if (!accessToken) return false;
+
+    // Step 1: 上传文件到机器人消息文件 API
+    const mediaId = await this.uploadRobotFile(robotCode, filePath, accessToken);
+    if (!mediaId) {
+      logger.warn('DingTalk-Client', 'Robot file upload failed, trying old media API');
+      // fallback 到旧 API
+      const oldMediaId = await this.uploadMedia(filePath, 'image');
+      if (!oldMediaId) return false;
+      return this.sendImageViaRobotApi(oldMediaId, robotCode, conversationType, conversationId, senderStaffId, accessToken);
+    }
+
+    return this.sendImageViaRobotApi(mediaId, robotCode, conversationType, conversationId, senderStaffId, accessToken);
+  }
+
+  // 上传文件到机器人消息文件 API
+  private async uploadRobotFile(robotCode: string, filePath: string, accessToken: string): Promise<string | null> {
+    if (!fs.existsSync(filePath)) {
+      logger.error('DingTalk-Client', 'File not found', { filePath });
+      return null;
+    }
+
+    try {
+      const form = new FormData();
+      form.append('file', fs.createReadStream(filePath), {
+        filename: path.basename(filePath),
+      });
+
+      const response = await axios.post(
+        `https://api.dingtalk.com/v1.0/robot/messageFiles/upload?robotCode=${encodeURIComponent(robotCode)}&type=image`,
+        form,
+        {
+          headers: {
+            ...form.getHeaders(),
+            'x-acs-dingtalk-access-token': accessToken,
+          }
+        }
+      );
+
+      const mediaId = response.data.mediaId;
+      logger.info('DingTalk-Client', 'Robot file uploaded', { mediaId });
+      return mediaId;
+    } catch (error: any) {
+      logger.error('DingTalk-Client', 'Failed to upload robot file', {
+        error: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      return null;
+    }
+  }
+
+  // 通过 Robot API 发送图片
+  private async sendImageViaRobotApi(
+    mediaId: string,
+    robotCode: string,
+    conversationType: string,
+    conversationId: string,
+    senderStaffId: string,
+    accessToken: string
+  ): Promise<boolean> {
+    try {
+      const msgParam = JSON.stringify({ photoURL: mediaId });
+
+      if (conversationType === '1') {
+        // 单聊
+        const response = await axios.post(
+          'https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend',
+          {
+            robotCode,
+            userIds: [senderStaffId],
+            msgKey: 'sampleImageMsg',
+            msgParam,
+          },
+          {
+            headers: {
+              'x-acs-dingtalk-access-token': accessToken,
+              'Content-Type': 'application/json',
+            }
+          }
+        );
+        logger.info('DingTalk-Client', 'Image sent via 1:1 robot API', { status: response.status, data: JSON.stringify(response.data).substring(0, 200) });
+      } else {
+        // 群聊
+        const response = await axios.post(
+          'https://api.dingtalk.com/v1.0/robot/groupMessages/send',
+          {
+            robotCode,
+            openConversationId: conversationId,
+            msgKey: 'sampleImageMsg',
+            msgParam,
+          },
+          {
+            headers: {
+              'x-acs-dingtalk-access-token': accessToken,
+              'Content-Type': 'application/json',
+            }
+          }
+        );
+        logger.info('DingTalk-Client', 'Image sent via group robot API', { status: response.status, data: JSON.stringify(response.data).substring(0, 200) });
+      }
+
+      return true;
+    } catch (error: any) {
+      logger.error('DingTalk-Client', 'Failed to send image via robot API', {
+        error: error.message,
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      return false;
     }
   }
 }
