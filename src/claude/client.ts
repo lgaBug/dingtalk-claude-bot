@@ -10,24 +10,23 @@ import { fileURLToPath } from 'url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-// 工具结果截断配置（与 Claude Code 终端一致：默认折叠 4 行）
-const COLLAPSED_RESULT_LINES = 4;
-const MAX_RESULT_CHARS = 2000;
+// 工具结果截断配置
+const MAX_RESULT_LINES = 25;
+const MAX_RESULT_CHARS = 1500;
 
 // 不需要展示结果的工具
 const QUIET_TOOLS = new Set([
   'ToolSearch', 'EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree',
-  'Skill', 'CronCreate', 'CronDelete', 'CronList',
+  'Skill', 'TodoWrite', 'CronCreate', 'CronDelete', 'CronList',
 ]);
 
-// 只读工具：紧凑显示（工具名 + 参数 + 行数统计，不展开结果）
-const READ_ONLY_TOOLS = new Set([
-  'Read', 'Glob', 'Grep', 'Agent', 'ToolSearch',
-]);
-
-// Claude Code 终端符号
-const DOT = '⏺';    // 工具/文本前缀（Windows: ⏺, macOS: ●）
-const CONNECTOR = '  ⎿  '; // 缩进连接符
+// 工具图标
+const TOOL_ICONS: Record<string, string> = {
+  Read: '📖', Bash: '⚡', Edit: '✏️', Write: '📝',
+  Glob: '🔍', Grep: '🔍', WebFetch: '🌐', WebSearch: '🔎',
+  Agent: '🤖', ToolSearch: '🔧', NotebookEdit: '📓',
+  TaskCreate: '📋', TaskUpdate: '📋', TaskGet: '📋', TaskList: '📋',
+};
 
 function generateUUIDFromString(str: string): string {
   const hash = createHash('sha256').update(str).digest('hex');
@@ -122,156 +121,128 @@ export class ClaudeClient {
     return '.../' + parts.slice(-3).join('/');
   }
 
-  /**
-   * 格式化工具调用 —— 还原 Claude Code 终端风格
-   *
-   * 只读工具：占位行（结果到来后合并为紧凑一行）
-   *   ⏺ Read path/file
-   *
-   * 非只读工具：展开显示
-   *   ⏺ Bash
-   *     ⎿  $ command
-   */
   private formatToolCall(name: string, input: Record<string, any>): string {
-    const isReadOnly = READ_ONLY_TOOLS.has(name);
+    const icon = TOOL_ICONS[name] || '🔧';
+    let paramStr = '';
 
-    // 生成参数展示文本（与 my-agent-cli 的 formatToolCall 对齐）
-    let displayText = '';
     switch (name) {
       case 'Read':
-        displayText = this.shortenPath(input.file_path);
+        paramStr = ` \`${this.shortenPath(input.file_path)}\``;
+        if (input.limit) paramStr += ` (lines ${input.offset || 1}-${(input.offset || 1) + input.limit})`;
         break;
-      case 'Bash':
-        displayText = `$ ${(input.command || '').substring(0, 300)}`;
+
+      case 'Bash': {
+        const cmd = (input.command || '').substring(0, 300);
+        paramStr = `\n\`\`\`bash\n${cmd}\n\`\`\``;
         break;
-      case 'Edit':
-        displayText = this.shortenPath(input.file_path);
+      }
+
+      case 'Edit': {
+        const fp = this.shortenPath(input.file_path);
+        paramStr = ` \`${fp}\``;
+        if (input.old_string && input.new_string) {
+          const oldLines = input.old_string.split('\n').slice(0, 8);
+          const newLines = input.new_string.split('\n').slice(0, 8);
+          const oldStr = oldLines.map((l: string) => `- ${l}`).join('\n');
+          const newStr = newLines.map((l: string) => `+ ${l}`).join('\n');
+          const oldTrunc = input.old_string.split('\n').length > 8 ? '\n  ...' : '';
+          const newTrunc = input.new_string.split('\n').length > 8 ? '\n  ...' : '';
+          paramStr += `\n\`\`\`diff\n${oldStr}${oldTrunc}\n${newStr}${newTrunc}\n\`\`\``;
+        }
         break;
+      }
+
       case 'Write':
-        displayText = this.shortenPath(input.file_path);
+        paramStr = ` \`${this.shortenPath(input.file_path)}\``;
         break;
+
       case 'Glob':
-        displayText = `${input.pattern || ''}${input.path ? ' in ' + this.shortenPath(input.path) : ''}`;
+        paramStr = ` \`${input.pattern}\``;
+        if (input.path) paramStr += ` in \`${this.shortenPath(input.path)}\``;
         break;
+
       case 'Grep':
-        displayText = `"${input.pattern || ''}"${input.path ? ' in ' + this.shortenPath(input.path) : ''}${input.glob ? ' (' + input.glob + ')' : ''}`;
+        paramStr = ` \`${input.pattern}\``;
+        if (input.path) paramStr += ` in \`${this.shortenPath(input.path)}\``;
         break;
+
       case 'WebFetch':
-        displayText = (input.url || '').substring(0, 100);
+        paramStr = ` \`${(input.url || '').substring(0, 100)}\``;
         break;
+
       case 'WebSearch':
-        displayText = `"${(input.query || '').substring(0, 80)}"`;
+        paramStr = ` "${(input.query || '').substring(0, 80)}"`;
         break;
+
       case 'Agent':
-        displayText = input.description || (input.prompt || '').substring(0, 50);
+        paramStr = input.prompt ? ` "${(input.prompt || '').substring(0, 80)}"` : '';
         break;
+
+      case 'ToolSearch':
+        paramStr = ` \`${input.query || ''}\``;
+        break;
+
       default: {
         const entries = Object.entries(input);
         if (entries.length > 0) {
-          const val = entries[0][1];
-          if (typeof val === 'string' && val.length < 100) displayText = val;
+          const [key, val] = entries[0];
+          if (typeof val === 'string' && val.length < 100) {
+            paramStr = ` \`${val}\``;
+          }
         }
       }
     }
 
-    if (isReadOnly) {
-      // 只读工具：先输出占位，结果到来后会替换为紧凑行
-      return `\n${DOT} **${name}** ${displayText}`;
-    }
-
-    // 非只读工具：工具名 + 命令/路径展开
-    let result = `\n${DOT} **${name}**`;
-    if (name === 'Bash') {
-      // Bash: 命令放在 ⎿ 行
-      result += `\n${CONNECTOR}${displayText}`;
-    } else if (displayText) {
-      // Edit/Write 等：路径跟在工具名后面
-      result += ` ${displayText}`;
-    }
-
-    return result;
+    return `\n\n---\n\n${icon} **${name}**${paramStr}\n`;
   }
 
-  /**
-   * 格式化工具结果 —— 还原 Claude Code 终端风格
-   *
-   * 只读工具：追加行数统计到工具调用行
-   *   ⏺ Read path/file *(42 lines)*
-   *
-   * 非只读工具：用 ⎿ 展开结果（最多 COLLAPSED_RESULT_LINES 行）
-   *   ⏺ Bash
-   *     ⎿  $ command
-   *     ⎿  output line 1
-   *     ⎿  output line 2
-   *     ⎿  … (+20 lines)
-   */
   private formatToolResult(toolName: string, content: any): string {
     if (QUIET_TOOLS.has(toolName)) {
       return '';
     }
 
-    // 归一化 content 为字符串
     if (content == null) {
-      content = '';
-    } else if (Array.isArray(content)) {
+      return '\n✅ Done\n';
+    }
+
+    if (Array.isArray(content)) {
       const refs = content.filter((c: any) => c.type === 'tool_reference');
-      if (refs.length > 0) return '';
-      content = '';
-    } else if (typeof content !== 'string') {
+      if (refs.length > 0) {
+        return '';
+      }
+      return '\n✅ Done\n';
+    }
+
+    if (typeof content !== 'string') {
       content = JSON.stringify(content, null, 2);
     }
 
-    const text = (content as string).trim();
-    const isReadOnly = READ_ONLY_TOOLS.has(toolName);
-
-    if (isReadOnly) {
-      // 只读工具：紧凑模式，只追加行数统计
-      if (!text) return ' *(empty)*';
-      const lineCount = text.split('\n').length;
-      return ` *(${lineCount} lines)*`;
+    if (!content.trim()) {
+      return '\n✅ Done\n';
     }
 
-    // 非只读工具：展开结果
-    if (!text) {
-      return `\n${CONNECTOR}*(no output)*`;
-    }
-
-    // 截断字符数
-    let resultStr = text;
-    if (resultStr.length > MAX_RESULT_CHARS) {
-      resultStr = resultStr.substring(0, MAX_RESULT_CHARS);
-    }
+    let resultStr = content as string;
+    let truncated = false;
 
     const lines = resultStr.split('\n');
-    const showLines = lines.slice(0, COLLAPSED_RESULT_LINES);
-    const truncated = lines.length > COLLAPSED_RESULT_LINES;
-
-    let output = '';
-
-    // Edit/Write 成功结果：用 ⎿ ✅ 显示
-    if ((toolName === 'Edit' || toolName === 'Write') &&
-        (resultStr.includes('successfully') || resultStr.includes('updated') || resultStr.includes('created'))) {
-      output += `\n${CONNECTOR}✅ ${showLines[0]}`;
-      return output;
+    if (lines.length > MAX_RESULT_LINES) {
+      resultStr = lines.slice(0, MAX_RESULT_LINES).join('\n');
+      truncated = true;
+    }
+    if (resultStr.length > MAX_RESULT_CHARS) {
+      resultStr = resultStr.substring(0, MAX_RESULT_CHARS);
+      truncated = true;
     }
 
-    // TodoWrite 特殊渲染：✓ / ■ / □ 状态图标
-    if (toolName === 'TodoWrite') {
-      for (const line of lines) {
-        output += `\n${CONNECTOR}${line}`;
+    const suffix = truncated ? `\n... (${lines.length} lines total)` : '';
+
+    if (toolName === 'Edit' || toolName === 'Write') {
+      if (resultStr.includes('successfully') || resultStr.includes('updated') || resultStr.includes('created')) {
+        return `\n✅ ${resultStr.trim()}\n`;
       }
-      return output;
     }
 
-    // 逐行输出，每行加 ⎿ 前缀
-    for (const line of showLines) {
-      output += `\n${CONNECTOR}${line}`;
-    }
-    if (truncated) {
-      output += `\n${CONNECTOR}*… (+${lines.length - COLLAPSED_RESULT_LINES} lines)*`;
-    }
-
-    return output;
+    return `\n\`\`\`\n${resultStr}${suffix}\n\`\`\`\n`;
   }
 
   private formatResultStats(event: ClaudeStreamEvent): string {
@@ -281,7 +252,7 @@ export class ClaudeClient {
     if (event.total_cost_usd) parts.push(`$${event.total_cost_usd.toFixed(4)}`);
 
     if (parts.length === 0) return '';
-    return `\n\n*⏱ ${parts.join(' · ')}*`;
+    return `\n\n---\n*⏱ ${parts.join(' · ')}*\n`;
   }
 
   // ==================== Proxy 连接管理 ====================
@@ -516,7 +487,7 @@ export class ClaudeClient {
                 const errContent = typeof block.content === 'string'
                   ? block.content
                   : JSON.stringify(block.content);
-                const formatted = `\n${CONNECTOR}❌ ${errContent.substring(0, 500)}`;
+                const formatted = `\n❌ **Error**: ${errContent.substring(0, 500)}\n`;
                 if (pending?.onChunk) {
                   pending.onChunk(formatted);
                 }
