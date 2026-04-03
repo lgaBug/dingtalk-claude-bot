@@ -87,18 +87,21 @@ interface ToolUseInfo {
 export class ClaudeClient {
   private processName: string;
   private sessionId: string;
+  private workingDirectory: string;
   private socket: net.Socket | null = null;
   private buffer: string = '';
   private pendingRequest: PendingRequest | null = null;
   private connected: boolean = false;
   private toolUseMap: Map<string, ToolUseInfo> = new Map();
 
-  constructor(processName: string = 'default') {
+  constructor(processName: string = 'default', workingDirectory?: string) {
     this.processName = processName;
+    this.workingDirectory = workingDirectory || process.cwd();
     this.sessionId = generateUUIDFromString(processName);
     logger.info('Claude-Code', 'ClaudeClient created', {
       processName,
       sessionId: this.sessionId,
+      workingDirectory: this.workingDirectory,
     });
   }
 
@@ -279,6 +282,7 @@ export class ClaudeClient {
     logger.info('Claude-Code', 'Starting Claude proxy...', {
       processName: this.processName,
       sessionId: this.sessionId,
+      workingDirectory: this.workingDirectory,
     });
 
     // Determine proxy script path (support both dev and prod)
@@ -289,10 +293,10 @@ export class ClaudeClient {
 
     if (fs.existsSync(tsProxy)) {
       // Dev mode: use node --import tsx to run TypeScript directly
-      args = ['--import', 'tsx', tsProxy, this.processName, this.sessionId];
+      args = ['--import', 'tsx', tsProxy, this.processName, this.sessionId, this.workingDirectory];
     } else if (fs.existsSync(jsProxy)) {
       // Prod mode: compiled JS
-      args = [jsProxy, this.processName, this.sessionId];
+      args = [jsProxy, this.processName, this.sessionId, this.workingDirectory];
     } else {
       logger.error('Claude-Code', 'Proxy script not found', { tsProxy, jsProxy });
       throw new Error('Proxy script not found');

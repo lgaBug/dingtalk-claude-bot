@@ -1,88 +1,109 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+本文档为 Claude Code (claude.ai/code) 在此仓库中工作提供指导。
 
-## Project Overview
+## 项目概述
 
-DingTalk bot that integrates with Claude Code CLI. Receives messages via DingTalk's streaming WebSocket API, forwards them to a locally running Claude Code CLI subprocess, and streams back **all events** (tool calls, tool results, text responses) as formatted Markdown in DingTalk interactive cards.
+钉钉机器人，集成 Claude Code CLI。通过钉钉流式 WebSocket API 接收消息，转发给本地运行的 Claude Code CLI 子进程，并将**所有事件**（工具调用、工具结果、文本回复）以格式化 Markdown 形式实时回传到钉钉互动卡片。
 
-## Commands
+## 常用命令
 
 ```bash
-npm run dev    # Development with hot-reload (tsx watch)
-npm run build  # Compile TypeScript to dist/
-npm start      # Production server from dist/
+npm run dev       # 开发模式，热重载 (tsx watch)
+npm run dev:watch # 开发模式，监听模式
+npm run build     # 编译 TypeScript 到 dist/
+npm start         # 生产环境，从 dist/ 启动
 ```
 
-## Architecture
+**前置要求**: 必须全局安装 Claude Code CLI (`npm install -g @anthropic-ai/claude-code`)。
+
+## 架构概览
 
 ```
-src/index.ts              # Entry point - wires up components, graceful shutdown
-src/server/express.ts      # Express health check endpoint
-src/dingtalk/bot.ts        # DingTalkBot - message routing, conversation state, dedup
-src/dingtalk/client.ts      # DingTalkClient - WebSocket stream, card API, token cache
-src/claude/client.ts       # ClaudeClient - proxy connection, event parsing, formatting
-src/claude/proxy.ts        # Claude Proxy - standalone process managing Claude CLI
-src/config.ts              # Environment variables
-src/logger.ts              # Structured logger (console + file)
-src/mcp/dingtalk-image-server.ts  # MCP Tool Server: send images to DingTalk
+src/index.ts              # 入口 - 组装组件、优雅停机
+src/server/express.ts     # Express 健康检查端点
+src/dingtalk/bot.ts       # DingTalkBot - 消息路由、会话状态、去重
+src/dingtalk/client.ts    # DingTalkClient - WebSocket 流、卡片 API、Token 缓存
+src/claude/client.ts      # ClaudeClient - Proxy 连接、事件解析、格式化
+src/claude/proxy.ts       # Claude Proxy - 独立进程，管理 Claude CLI 生命周期
+src/config.ts             # 环境变量配置
+src/logger.ts             # 结构化日志（控制台 + 文件）
+src/mcp/dingtalk-image-server.ts  # MCP 工具服务：发送图片到钉钉
 ```
 
-## Key Design Patterns
+## 核心设计模式
 
-**Proxy Architecture**: Bot communicates with Claude CLI through an independent Proxy process via Named Pipe (Windows) / Unix Socket. This enables:
-- Bot restart without killing Claude CLI (Proxy + CLI keep running)
-- Process name-based matching (configured via `CLAUDE_PROCESS_NAME`)
-- Automatic Proxy startup if not already running
-- Automatic Claude CLI restart if it crashes
+**Proxy 架构**: Bot 通过 Named Pipe（Windows）/ Unix Socket 与独立的 Proxy 进程通信，Proxy 管理 Claude CLI。优势：
+- Bot 重启不影响 Claude CLI（Proxy + CLI 持续运行）
+- 基于进程名匹配（通过 `CLAUDE_PROCESS_NAME` 配置）
+- Proxy 未运行时自动启动
+- Claude CLI 崩溃后自动重启
 
 ```
-Bot (restartable) ←Named Pipe→ Claude Proxy (long-lived) ←stdio→ Claude CLI (long-lived)
+Bot (可重启) ←Named Pipe→ Claude Proxy (长驻) ←stdio→ Claude CLI (长驻)
 ```
 
-**Event Pipeline**: DingTalk WebSocket → DingTalkClient → DingTalkBot → ClaudeClient → Named Pipe → Proxy → Claude CLI → stream-json events → format as Markdown → DingTalk card update
+**事件流水线**: 钉钉 WebSocket → DingTalkClient → DingTalkBot → ClaudeClient → Named Pipe → Proxy → Claude CLI → stream-json 事件 → 格式化为 Markdown → 钉钉卡片更新
 
-**Full Event Streaming**: All Claude CLI events are processed and displayed:
-- `assistant(tool_use)` → formatted tool call with icon + params (Read, Bash, Edit diffs, etc.)
-- `user(tool_result)` → tool execution result (truncated at 25 lines / 1500 chars)
-- `assistant(text)` → Claude's text response (pass-through)
-- `result` → completion stats (turns, duration, cost)
+**事件格式化** (`claude/client.ts`):
+- `assistant(tool_use)` → `📖 Read`、`⚡ Bash`、`✏️ Edit` + 格式化参数
+- `user(tool_result)` → 截断展示结果（最多 25 行 / 1500 字符）；静默工具不展示
+- `assistant(text)` → 透传文本
+- `result` → `⏱ turns · duration · cost` 统计
+- 图片检测：自动发送 `Write`/`Bash` 工具创建的 `.png/.jpg/.gif/.webp` 文件
 
-**Token Caching**: DingTalk access token cached for 2 hours (refreshed 5 min early) to avoid rate limiting.
+**多卡片分页**: 响应超过 6000 字符时，自动 finalize 当前卡片并创建新卡片。卡片显示 `(Part N)` 标签和续接提示。
 
-**Session Management**: Claude CLI `--session-id` derived deterministically from `CLAUDE_PROCESS_NAME`. Conversation context persists across bot and proxy restarts.
+**Token 缓存**: 钉钉 access token 缓存 2 小时（提前 5 分钟刷新），避免频率限制。
 
-**Deduplication**: `processingMessages` Map tracks `msgUid` with 2-minute TTL, cleaned up every 5 minutes.
+**会话管理**: Claude CLI `--session-id` 由 `CLAUDE_PROCESS_NAME` 确定性生成（SHA256 哈希）。会话上下文在 Bot 和 Proxy 重启后持久化。
 
-**History Cap**: In-memory conversation history capped at 50 messages per conversation.
+**去重机制**: `processingMessages` Map 跟踪 `msgUid`，TTL 2 分钟，每 5 分钟清理一次。
 
-## Configuration
+**历史上限**: 每个会话内存中最多保留 50 条消息。
 
-Environment variables (see `.env.example`):
-- `DINGTALK_CLIENT_ID` - DingTalk app client ID (required)
-- `DINGTALK_CLIENT_SECRET` - DingTalk app client secret (required)
-- `DINGTALK_CARD_TEMPLATE_ID` - DingTalk card template ID (optional)
-- `PORT` - Server port (default 3000)
-- `CLAUDE_PROCESS_NAME` - Claude CLI proxy name for process matching (default: 'default')
-- `DINGTALK_ROBOT_CODE` - DingTalk robot code, required for MCP image tool
+**卡片更新防抖**: 500ms 间隔避免频率限制；内容未变化时跳过更新。
 
-## Proxy Management
+## 配置项
 
-Proxy runs as a detached process, survives bot restarts. Useful commands:
-- Proxy PID file: `%TEMP%/claude-proxy-<name>.pid`
-- Proxy log: `%TEMP%/claude-proxy-<name>.log`
-- Named pipe: `\\.\pipe\claude-bot-<name>` (Windows)
-- To manually stop proxy: kill the PID from the PID file
+环境变量（见 `.env.example`）：
+- `DINGTALK_CLIENT_ID` - 钉钉应用 Client ID（必填）
+- `DINGTALK_CLIENT_SECRET` - 钉钉应用 Client Secret（必填）
+- `DINGTALK_CARD_TEMPLATE_ID` - 钉钉卡片模板 ID（可选，默认：`ed5262bd-f1d2-4def-ae1e-249c6cb5643a.schema`）
+- `PORT` - 服务器端口（默认：3000）
+- `CLAUDE_PROCESS_NAME` - Claude CLI Proxy 进程名，用于进程匹配（默认：'default'）
+- `CLAUDE_WORKING_DIRECTORY` - Claude CLI 工作目录（可选，默认：Bot 启动目录）
+- `DINGTALK_ROBOT_CODE` - 钉钉机器人 Code，MCP 图片工具和群聊支持必填
 
-## MCP Image Tool
+## Proxy 管理
 
-Standalone MCP Tool Server (`dingtalk_send_image`) for sending images to DingTalk. Can be used by any Claude Code instance.
+Proxy 作为独立进程运行，Bot 重启后依然存活。有用命令：
+- Proxy PID 文件：`%TEMP%/claude-proxy-<name>.pid`（Windows）或 `/tmp/claude-proxy-<name>.pid`（Unix）
+- Proxy 日志：`%TEMP%/claude-proxy-<name>.log` 或 `/tmp/claude-proxy-<name>.log`
+- Named Pipe：`\\.\pipe\claude-bot-<name>`（Windows）或 `/tmp/claude-bot-<name>.sock`（Unix）
+- 手动停止 Proxy：`kill $(cat <pidfile>)`（会同时停止 Claude CLI）
 
-Register globally:
+**自动重启**: Claude CLI 崩溃后，Proxy 以指数退避重启（3s、6s、12s、24s、48s），最多 5 次。成功初始化后（60s 正常运行）重置计数器。
+
+## MCP 图片工具
+
+独立的 MCP 工具服务（`dingtalk_send_image`），用于发送图片到钉钉。任何 Claude Code 实例均可使用。
+
+全局注册：
 ```bash
 claude mcp add --global dingtalk-image -- node --import tsx /path/to/src/mcp/dingtalk-image-server.ts
 ```
 
-Requires env vars: `DINGTALK_CLIENT_ID`, `DINGTALK_CLIENT_SECRET`, `DINGTALK_ROBOT_CODE`.
+需要环境变量：`DINGTALK_CLIENT_ID`、`DINGTALK_CLIENT_SECRET`、`DINGTALK_ROBOT_CODE`。
 
-When invoked via the Bot, `.dingtalk-context.json` provides the send target automatically.
+当通过 Bot 触发时，`.dingtalk-context.json` 自动提供发送目标：
+```json
+{
+  "conversationId": "...",
+  "conversationType": "1" | "2",
+  "senderStaffId": "...",
+  "robotCode": "..."
+}
+```
+
+**自动检测**: `ClaudeClient` 自动检测 `Write` 或 `Bash` 工具创建的图片文件（`.png/.jpg/.jpeg/.gif/.bmp/.webp`）并触发 `onImage` 回调。

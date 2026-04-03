@@ -10,6 +10,7 @@ export const config = {
   },
   claude: {
     processName: process.env.CLAUDE_PROCESS_NAME || 'default',
+    workingDirectory: process.env.CLAUDE_WORKING_DIRECTORY || process.cwd(),
   },
   port: parseInt(process.env.PORT || '3000', 10),
 };

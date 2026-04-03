@@ -7,7 +7,10 @@ import { ClaudeClient } from './claude/client.js';
 async function main() {
   console.log('=== Bot Starting ===');
 
-  const claudeClient = new ClaudeClient(config.claude.processName);
+  const claudeClient = new ClaudeClient(
+    config.claude.processName,
+    config.claude.workingDirectory
+  );
 
   const dingtalkClient = new DingTalkClient({
     botToken: config.dingtalk.clientId,

@@ -19,6 +19,7 @@ import * as path from 'path';
 
 const processName = process.argv[2] || 'default';
 const sessionId = process.argv[3] || 'default-session';
+const workingDirectory = process.argv[4] || process.cwd();
 
 const pipePath = os.platform() === 'win32'
   ? `\\\\.\\pipe\\claude-bot-${processName}`
@@ -60,25 +61,34 @@ function startClaude() {
     '--verbose', '--session-id', sessionId, '--dangerously-skip-permissions',
   ];
 
-  log(`Starting Claude CLI: session=${sessionId} (attempt ${restartCount + 1}/${MAX_RESTART_RETRIES})`);
+  log(`Starting Claude CLI: session=${sessionId}, cwd=${workingDirectory} (attempt ${restartCount + 1}/${MAX_RESTART_RETRIES})`);
 
   if (isWindows) {
     const bashPath = 'C:\\Program Files\\Git\\usr\\bin\\bash.exe';
     if (fs.existsSync(bashPath)) {
       claude = spawn(bashPath, ['-c', `claude ${claudeArgs.join(' ')}`], {
         stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: workingDirectory,
         windowsHide: true,
       });
     } else {
       claude = spawn('claude', claudeArgs, {
         stdio: ['pipe', 'pipe', 'pipe'],
+        cwd: workingDirectory,
         shell: true,
         windowsHide: true,
       });
     }
   } else {
-    claude = spawn('claude', claudeArgs, {
+    // 使用 shell: true 以确保环境变量正确加载，通过 -c 执行 claude 命令
+    // 展开 ~ 为完整的 HOME 路径
+    const resolvedCwd = workingDirectory.startsWith('~/')
+      ? path.join(os.homedir(), workingDirectory.slice(2))
+      : workingDirectory;
+    claude = spawn('sh', ['-c', `/opt/homebrew/bin/claude ${claudeArgs.join(' ')}`], {
       stdio: ['pipe', 'pipe', 'pipe'],
+      cwd: resolvedCwd || process.cwd(),
+      env: { ...process.env, HOME: os.homedir() },
     });
   }
 
