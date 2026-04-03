@@ -11,21 +11,27 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 // 工具结果截断配置
-const MAX_RESULT_LINES = 25;
-const MAX_RESULT_CHARS = 1500;
+const MAX_RESULT_LINES = 6;
+const MAX_RESULT_CHARS = 2000;
 
 // 不需要展示结果的工具
 const QUIET_TOOLS = new Set([
   'ToolSearch', 'EnterPlanMode', 'ExitPlanMode', 'EnterWorktree', 'ExitWorktree',
-  'Skill', 'TodoWrite', 'CronCreate', 'CronDelete', 'CronList',
+  'Skill', 'CronCreate', 'CronDelete', 'CronList',
+]);
+
+// 只读工具：紧凑显示（工具名 + 参数 + 行数统计，不展开结果）
+const READ_ONLY_TOOLS = new Set([
+  'Read', 'Glob', 'Grep', 'ToolSearch',
 ]);
 
 // 工具图标
 const TOOL_ICONS: Record<string, string> = {
   Read: '📖', Bash: '⚡', Edit: '✏️', Write: '📝',
-  Glob: '🔍', Grep: '🔍', WebFetch: '🌐', WebSearch: '🔎',
-  Agent: '🤖', ToolSearch: '🔧', NotebookEdit: '📓',
+  Glob: '🔍', Grep: '🔎', WebFetch: '🌐', WebSearch: '🔎',
+  Agent: '🤖', NotebookEdit: '📓',
   TaskCreate: '📋', TaskUpdate: '📋', TaskGet: '📋', TaskList: '📋',
+  TodoWrite: '📋',
 };
 
 function generateUUIDFromString(str: string): string {
@@ -92,6 +98,7 @@ export class ClaudeClient {
   private pendingRequest: PendingRequest | null = null;
   private connected: boolean = false;
   private toolUseMap: Map<string, ToolUseInfo> = new Map();
+  private lastEventWasTool: boolean = false; // 追踪是否需要在文字前加分隔线
 
   constructor(processName: string = 'default') {
     this.processName = processName;
@@ -123,77 +130,63 @@ export class ClaudeClient {
 
   private formatToolCall(name: string, input: Record<string, any>): string {
     const icon = TOOL_ICONS[name] || '🔧';
-    let paramStr = '';
 
     switch (name) {
-      case 'Read':
-        paramStr = ` \`${this.shortenPath(input.file_path)}\``;
-        if (input.limit) paramStr += ` (lines ${input.offset || 1}-${(input.offset || 1) + input.limit})`;
-        break;
+      case 'Read': {
+        const fp = this.shortenPath(input.file_path);
+        // 只读：紧凑行，行数由 formatToolResult 追加
+        return `\n\n${icon} **Read** \`${fp}\``;
+      }
 
       case 'Bash': {
         const cmd = (input.command || '').substring(0, 300);
-        paramStr = `\n\`\`\`bash\n${cmd}\n\`\`\``;
-        break;
+        return `\n\n${icon} **Bash**\n\`\`\`\n${cmd}\n\`\`\``;
       }
 
       case 'Edit': {
         const fp = this.shortenPath(input.file_path);
-        paramStr = ` \`${fp}\``;
+        let result = `\n\n${icon} **Edit** \`${fp}\``;
         if (input.old_string && input.new_string) {
-          const oldLines = input.old_string.split('\n').slice(0, 8);
-          const newLines = input.new_string.split('\n').slice(0, 8);
-          const oldStr = oldLines.map((l: string) => `- ${l}`).join('\n');
-          const newStr = newLines.map((l: string) => `+ ${l}`).join('\n');
-          const oldTrunc = input.old_string.split('\n').length > 8 ? '\n  ...' : '';
-          const newTrunc = input.new_string.split('\n').length > 8 ? '\n  ...' : '';
-          paramStr += `\n\`\`\`diff\n${oldStr}${oldTrunc}\n${newStr}${newTrunc}\n\`\`\``;
+          const oldLines = input.old_string.split('\n').slice(0, 6);
+          const newLines = input.new_string.split('\n').slice(0, 6);
+          const diffLines: string[] = [];
+          oldLines.forEach((l: string) => diffLines.push(`- ${l}`));
+          if (input.old_string.split('\n').length > 6) diffLines.push('  ...');
+          newLines.forEach((l: string) => diffLines.push(`+ ${l}`));
+          if (input.new_string.split('\n').length > 6) diffLines.push('  ...');
+          result += `\n\`\`\`diff\n${diffLines.join('\n')}\n\`\`\``;
         }
-        break;
+        return result;
       }
 
       case 'Write':
-        paramStr = ` \`${this.shortenPath(input.file_path)}\``;
-        break;
+        return `\n\n${icon} **Write** \`${this.shortenPath(input.file_path)}\``;
 
       case 'Glob':
-        paramStr = ` \`${input.pattern}\``;
-        if (input.path) paramStr += ` in \`${this.shortenPath(input.path)}\``;
-        break;
+        return `\n\n${icon} **Glob** \`${input.pattern}\`${input.path ? ' in `' + this.shortenPath(input.path) + '`' : ''}`;
 
       case 'Grep':
-        paramStr = ` \`${input.pattern}\``;
-        if (input.path) paramStr += ` in \`${this.shortenPath(input.path)}\``;
-        break;
-
-      case 'WebFetch':
-        paramStr = ` \`${(input.url || '').substring(0, 100)}\``;
-        break;
-
-      case 'WebSearch':
-        paramStr = ` "${(input.query || '').substring(0, 80)}"`;
-        break;
+        return `\n\n${icon} **Grep** \`${input.pattern}\`${input.path ? ' in `' + this.shortenPath(input.path) + '`' : ''}`;
 
       case 'Agent':
-        paramStr = input.prompt ? ` "${(input.prompt || '').substring(0, 80)}"` : '';
-        break;
+        return `\n\n${icon} **Agent** ${input.description || (input.prompt || '').substring(0, 60)}`;
 
-      case 'ToolSearch':
-        paramStr = ` \`${input.query || ''}\``;
-        break;
+      case 'WebFetch':
+        return `\n\n${icon} **WebFetch** \`${(input.url || '').substring(0, 100)}\``;
+
+      case 'WebSearch':
+        return `\n\n${icon} **WebSearch** \`${(input.query || '').substring(0, 80)}\``;
 
       default: {
+        let paramStr = '';
         const entries = Object.entries(input);
         if (entries.length > 0) {
-          const [key, val] = entries[0];
-          if (typeof val === 'string' && val.length < 100) {
-            paramStr = ` \`${val}\``;
-          }
+          const val = entries[0][1];
+          if (typeof val === 'string' && val.length < 100) paramStr = ` \`${val}\``;
         }
+        return `\n\n${icon} **${name}**${paramStr}`;
       }
     }
-
-    return `\n\n---\n\n${icon} **${name}**${paramStr}\n`;
   }
 
   private formatToolResult(toolName: string, content: any): string {
@@ -201,48 +194,65 @@ export class ClaudeClient {
       return '';
     }
 
+    // 归一化 content
     if (content == null) {
-      return '\n✅ Done\n';
-    }
-
-    if (Array.isArray(content)) {
+      content = '';
+    } else if (Array.isArray(content)) {
       const refs = content.filter((c: any) => c.type === 'tool_reference');
-      if (refs.length > 0) {
-        return '';
-      }
-      return '\n✅ Done\n';
-    }
-
-    if (typeof content !== 'string') {
+      if (refs.length > 0) return '';
+      content = '';
+    } else if (typeof content !== 'string') {
       content = JSON.stringify(content, null, 2);
     }
 
-    if (!content.trim()) {
-      return '\n✅ Done\n';
+    const text = (content as string).trim();
+    const isReadOnly = READ_ONLY_TOOLS.has(toolName);
+
+    // 只读工具：追加行数
+    if (isReadOnly) {
+      if (!text) return ' _(empty)_';
+      const lineCount = text.split('\n').length;
+      return ` _(${lineCount} lines)_`;
     }
 
-    let resultStr = content as string;
-    let truncated = false;
-
-    const lines = resultStr.split('\n');
-    if (lines.length > MAX_RESULT_LINES) {
-      resultStr = lines.slice(0, MAX_RESULT_LINES).join('\n');
-      truncated = true;
+    // Edit/Write 成功
+    if ((toolName === 'Edit' || toolName === 'Write') &&
+        text && (text.includes('successfully') || text.includes('updated') || text.includes('created'))) {
+      return `\n> ✅ ${text.split('\n')[0]}`;
     }
+
+    // 无输出
+    if (!text) {
+      return '\n> _(no output)_';
+    }
+
+    // 截断
+    let resultStr = text;
     if (resultStr.length > MAX_RESULT_CHARS) {
       resultStr = resultStr.substring(0, MAX_RESULT_CHARS);
-      truncated = true;
+    }
+    const lines = resultStr.split('\n');
+    const showLines = lines.slice(0, MAX_RESULT_LINES);
+    const truncated = lines.length > MAX_RESULT_LINES;
+
+    // Bash 输出用代码块
+    if (toolName === 'Bash') {
+      let block = '\n```\n' + showLines.join('\n');
+      if (truncated) block += `\n... (+${lines.length - MAX_RESULT_LINES} lines)`;
+      block += '\n```';
+      return block;
     }
 
-    const suffix = truncated ? `\n... (${lines.length} lines total)` : '';
-
-    if (toolName === 'Edit' || toolName === 'Write') {
-      if (resultStr.includes('successfully') || resultStr.includes('updated') || resultStr.includes('created')) {
-        return `\n✅ ${resultStr.trim()}\n`;
-      }
+    // TodoWrite 用列表
+    if (toolName === 'TodoWrite') {
+      return '\n' + lines.map(line => `> ${line}`).join('\n');
     }
 
-    return `\n\`\`\`\n${resultStr}${suffix}\n\`\`\`\n`;
+    // 其他工具：代码块
+    let block = '\n```\n' + showLines.join('\n');
+    if (truncated) block += `\n... (+${lines.length - MAX_RESULT_LINES} lines)`;
+    block += '\n```';
+    return block;
   }
 
   private formatResultStats(event: ClaudeStreamEvent): string {
@@ -252,7 +262,7 @@ export class ClaudeClient {
     if (event.total_cost_usd) parts.push(`$${event.total_cost_usd.toFixed(4)}`);
 
     if (parts.length === 0) return '';
-    return `\n\n---\n*⏱ ${parts.join(' · ')}*\n`;
+    return `\n\n*⏱ ${parts.join(' · ')}*`;
   }
 
   // ==================== Proxy 连接管理 ====================
@@ -450,6 +460,11 @@ export class ClaudeClient {
             if (block.type === 'text' && block.text) {
               logger.debug('Claude-Code', 'Text chunk', { textLength: block.text.length });
               if (pending?.onChunk) {
+                // 从工具区域过渡到文字回复时，插入分隔线
+                if (this.lastEventWasTool) {
+                  pending.onChunk('\n\n---\n\n');
+                  this.lastEventWasTool = false;
+                }
                 pending.onChunk(block.text);
               }
             } else if (block.type === 'tool_use' && block.name) {
@@ -466,6 +481,7 @@ export class ClaudeClient {
               if (pending?.onChunk) {
                 pending.onChunk(formatted);
               }
+              this.lastEventWasTool = true;
             }
           }
           break;
@@ -487,7 +503,7 @@ export class ClaudeClient {
                 const errContent = typeof block.content === 'string'
                   ? block.content
                   : JSON.stringify(block.content);
-                const formatted = `\n❌ **Error**: ${errContent.substring(0, 500)}\n`;
+                const formatted = `\n\n> ❌ ${errContent.substring(0, 500)}`;
                 if (pending?.onChunk) {
                   pending.onChunk(formatted);
                 }
@@ -585,8 +601,9 @@ export class ClaudeClient {
       return;
     }
 
-    // Clear tool map for new conversation turn
+    // Clear state for new conversation turn
     this.toolUseMap.clear();
+    this.lastEventWasTool = false;
 
     await this.sendMessage(userMessage, onChunk, onComplete, onError, onImage);
   }
