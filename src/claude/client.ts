@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, execSync } from 'child_process';
 import { createHash } from 'crypto';
 import { logger } from '../logger.js';
 import * as fs from 'fs';
@@ -668,6 +668,30 @@ export class ClaudeClient {
     this.pendingRequest = null;
     this.toolUseMap.clear();
     logger.info('Claude-Code', 'Disconnected from proxy (proxy still running)');
+  }
+
+  /**
+   * 停止 Proxy 进程（及其管理的 Claude CLI），释放资源。
+   * 用于空闲会话清理。
+   */
+  stopProxy(): void {
+    this.disconnect();
+    try {
+      if (fs.existsSync(this.pidFile)) {
+        const pid = parseInt(fs.readFileSync(this.pidFile, 'utf-8').trim());
+        if (!isNaN(pid)) {
+          if (os.platform() === 'win32') {
+            execSync(`taskkill /PID ${pid} /T /F`, { timeout: 5000 });
+          } else {
+            process.kill(pid, 'SIGTERM');
+          }
+          logger.info('Claude-Code', 'Proxy process stopped', { processName: this.processName, pid });
+        }
+        fs.unlinkSync(this.pidFile);
+      }
+    } catch (e: any) {
+      logger.debug('Claude-Code', 'stopProxy cleanup error (may already be stopped)', { error: e.message });
+    }
   }
 
   isConnected(): boolean {
