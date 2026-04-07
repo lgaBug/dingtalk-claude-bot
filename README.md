@@ -41,7 +41,8 @@
 - **流式响应** — 通过钉钉互动卡片实时更新，无需等待完整响应
 - **多卡片分页** — 长任务输出自动拆分为多张卡片，内容不丢失
 - **单聊 + 群聊** — 支持 1:1 私聊和群内 @机器人，自动适配卡片投递模型
-- **多轮对话** — 基于固定 Session ID 保持上下文，Bot 重启后通过 `--resume` 自动续接
+- **会话隔离** — 每个会话（单聊/群聊）独立 Claude CLI 实例，上下文互不泄漏
+- **多轮对话** — 基于 Session ID 保持上下文，Bot 重启后通过 `--resume` 自动续接
 - **Proxy 架构** — Claude CLI 进程独立于 Bot，Bot 重启不影响 Claude CLI
 - **图片支持** — 自动检测 Claude 工具产生的图片文件并发送到钉钉
 - **消息去重** — 应对钉钉 At-Least-Once 投递语义
@@ -79,14 +80,14 @@ npm run build && npm start
 Bot 通过 Named Pipe 与独立的 Proxy 进程通信，Proxy 管理 Claude CLI 的生命周期。Bot 可以随意重启，不会影响正在运行的 Claude CLI。
 
 ```
-                          Named Pipe
-┌──────────┐  WebSocket  ┌──────┐ (\\.\pipe\...)  ┌───────┐  stdio   ┌──────────┐
-│  钉钉用户 │ ←─────────→ │ Bot  │ ←────────────→ │ Proxy │ ←──────→ │  Claude  │
-│          │  Stream API  │      │                │(长生命) │          │ Code CLI │
-└──────────┘             └──┬───┘                └───────┘          └──────────┘
-                            │                        ↑
-                 updateCard()                   detached 进程
-                            │                   Bot 重启后自动重连
+                          Named Pipe (per conversation)
+┌──────────┐  WebSocket  ┌──────┐ ←→ Proxy-{hash1} ←stdio→ Claude CLI (会话A)
+│  钉钉用户 │ ←─────────→ │ Bot  │ ←→ Proxy-{hash2} ←stdio→ Claude CLI (会话B)
+│          │  Stream API  │      │ ←→ Proxy-{hash3} ←stdio→ Claude CLI (会话C)
+└──────────┘             └──┬───┘     (各会话独立隔离, max 10, idle 30min 回收)
+                            │
+                 updateCard()
+                            │
                      ┌──────┴──────┐
                      │  钉钉卡片    │
                      │ (Markdown)   │
@@ -130,6 +131,8 @@ src/
 **进程名匹配** — 通过 `CLAUDE_PROCESS_NAME` 配置进程名，Bot 只连接匹配的 Proxy。不同的 Bot 实例可使用不同名称，互不干扰。
 
 **自动重启** — Proxy 在 Claude CLI 崩溃后自动重启（指数退避，最多 5 次）。成功初始化后重置计数器。
+
+**会话隔离** — 每个钉钉 `conversationId` 对应独立的 Proxy + Claude CLI 实例（processName 为 `{baseName}-{hash}`），单聊和群聊的上下文完全隔离，不同群之间也互不可见。通过 LRU 淘汰（最多 10 个并发）和空闲回收（30 分钟无活动自动停止）控制资源消耗。
 
 **Session 恢复** — 首次启动用 `--session-id` 创建新会话；后续重启自动检测已有 session 文件并用 `--resume` 恢复，避免 "Session ID already in use" 冲突。
 
