@@ -256,13 +256,9 @@ export class ClaudeClient {
   }
 
   private formatResultStats(event: ClaudeStreamEvent): string {
-    const parts: string[] = [];
-    if (event.num_turns) parts.push(`${event.num_turns} turns`);
-    if (event.duration_ms) parts.push(`${(event.duration_ms / 1000).toFixed(1)}s`);
-    if (event.total_cost_usd) parts.push(`$${event.total_cost_usd.toFixed(4)}`);
-
-    if (parts.length === 0) return '';
-    return `\n\n*⏱ ${parts.join(' · ')}*`;
+    // 替换为 sessionId 格式
+    // return `\n\n*sessionId: ${this.sessionId}*`;
+    return '';
   }
 
   // ==================== Proxy 连接管理 ====================
