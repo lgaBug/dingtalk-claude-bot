@@ -1,5 +1,6 @@
 import type { DingTalkClient } from './client.js';
-import type { ClaudeClient } from '../claude/client.js';
+import { ClaudeClient } from '../claude/client.js';
+import { createHash } from 'crypto';
 import { logger } from '../logger.js';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -7,6 +8,11 @@ import * as path from 'path';
 const MAX_HISTORY_MESSAGES = 50;
 const DEDUP_CLEANUP_INTERVAL = 5 * 60 * 1000;
 const DEDUP_TTL = 2 * 60 * 1000;
+
+// 会话隔离配置
+const MAX_CONCURRENT_CLIENTS = 10;          // 最大并发 Claude 实例
+const CLIENT_IDLE_TIMEOUT = 30 * 60 * 1000; // 空闲 30 分钟后回收
+const CLIENT_CLEANUP_INTERVAL = 5 * 60 * 1000; // 每 5 分钟检查一次
 
 // 卡片更新配置
 const CARD_UPDATE_INTERVAL = 500;    // 防抖间隔：500ms
@@ -27,21 +33,111 @@ interface Conversation {
   outTrackId?: string;
 }
 
+interface ClientEntry {
+  client: ClaudeClient;
+  lastActivity: number;
+}
+
 export class DingTalkBot {
   private dingtalk: DingTalkClient;
-  private claude: ClaudeClient;
+  private baseProcessName: string;
+  private claudeClients: Map<string, ClientEntry> = new Map();
   private conversations: Map<string, Conversation> = new Map();
   private processingMessages: Map<string, number> = new Map();
-  private initialized: boolean = false;
   private dedupCleanupTimer?: ReturnType<typeof setInterval>;
+  private clientCleanupTimer?: ReturnType<typeof setInterval>;
 
-  constructor(dingtalk: DingTalkClient, claude: ClaudeClient) {
+  constructor(dingtalk: DingTalkClient, baseProcessName: string) {
     this.dingtalk = dingtalk;
-    this.claude = claude;
+    this.baseProcessName = baseProcessName;
 
     this.dedupCleanupTimer = setInterval(() => {
       this.cleanupProcessingMessages();
     }, DEDUP_CLEANUP_INTERVAL);
+
+    this.clientCleanupTimer = setInterval(() => {
+      this.cleanupIdleClients();
+    }, CLIENT_CLEANUP_INTERVAL);
+  }
+
+  /**
+   * 根据 conversationId 生成唯一的 processName
+   */
+  private getProcessName(conversationId: string): string {
+    const hash = createHash('sha256').update(conversationId).digest('hex').substring(0, 8);
+    return `${this.baseProcessName}-${hash}`;
+  }
+
+  /**
+   * 获取或创建 per-conversation 的 ClaudeClient
+   */
+  private async getOrCreateClient(conversationId: string): Promise<ClaudeClient> {
+    const entry = this.claudeClients.get(conversationId);
+    if (entry) {
+      entry.lastActivity = Date.now();
+      if (entry.client.isConnected()) return entry.client;
+      // 尝试重连
+      const ok = await entry.client.connect();
+      if (ok) return entry.client;
+    }
+
+    // 超过上限时淘汰最久未使用的
+    if (this.claudeClients.size >= MAX_CONCURRENT_CLIENTS) {
+      this.evictLruClient();
+    }
+
+    const processName = this.getProcessName(conversationId);
+    const client = new ClaudeClient(processName);
+    const ok = await client.connect();
+    if (!ok) {
+      throw new Error(`Failed to connect Claude proxy for conversation ${conversationId}`);
+    }
+
+    this.claudeClients.set(conversationId, { client, lastActivity: Date.now() });
+    logger.info('DingTalk-Bot', 'Created new Claude client for conversation', {
+      conversationId,
+      processName,
+      totalClients: this.claudeClients.size,
+    });
+    return client;
+  }
+
+  /**
+   * 淘汰最久未使用的客户端
+   */
+  private evictLruClient(): void {
+    let oldestId: string | null = null;
+    let oldestTime = Infinity;
+    for (const [id, entry] of this.claudeClients) {
+      if (entry.lastActivity < oldestTime) {
+        oldestTime = entry.lastActivity;
+        oldestId = id;
+      }
+    }
+    if (oldestId) {
+      const entry = this.claudeClients.get(oldestId)!;
+      entry.client.stopProxy();
+      this.claudeClients.delete(oldestId);
+      logger.info('DingTalk-Bot', 'Evicted LRU client', { conversationId: oldestId });
+    }
+  }
+
+  /**
+   * 清理空闲超时的客户端
+   */
+  private cleanupIdleClients(): void {
+    const now = Date.now();
+    let cleaned = 0;
+    for (const [id, entry] of this.claudeClients) {
+      if (now - entry.lastActivity > CLIENT_IDLE_TIMEOUT) {
+        entry.client.stopProxy();
+        this.claudeClients.delete(id);
+        cleaned++;
+      }
+    }
+    if (cleaned > 0) {
+      logger.info('DingTalk-Bot', 'Cleaned up idle clients', { cleaned, remaining: this.claudeClients.size });
+    }
   }
 
   private cleanupProcessingMessages(): void {
@@ -62,26 +158,14 @@ export class DingTalkBot {
     if (this.dedupCleanupTimer) {
       clearInterval(this.dedupCleanupTimer);
     }
-  }
-
-  async preInitializeClaude(): Promise<boolean> {
-    if (this.initialized) return true;
-
-    logger.info('DingTalk-Bot', 'Connecting to Claude proxy...');
-    const success = await this.claude.connect();
-
-    if (success) {
-      this.initialized = true;
-      logger.info('DingTalk-Bot', 'Claude proxy connection established');
-    } else {
-      logger.error('DingTalk-Bot', 'Claude proxy connection failed');
+    if (this.clientCleanupTimer) {
+      clearInterval(this.clientCleanupTimer);
     }
-
-    return success;
-  }
-
-  isInitialized(): boolean {
-    return this.initialized;
+    // 断开所有客户端（不杀 proxy，让它们自然存活以便 bot 重启后复用）
+    for (const [, entry] of this.claudeClients) {
+      entry.client.disconnect();
+    }
+    this.claudeClients.clear();
   }
 
   // 截断过长的卡片内容，保留开头提示和最新内容
@@ -165,6 +249,18 @@ export class DingTalkBot {
         } catch (e: any) {
           logger.warn('DingTalk-Bot', 'Failed to write context file', { error: e.message });
         }
+      }
+
+      // 获取该会话专属的 Claude 客户端
+      let claudeClient: ClaudeClient;
+      try {
+        claudeClient = await this.getOrCreateClient(conversationId);
+      } catch (e: any) {
+        logger.error('DingTalk-Bot', 'Failed to get Claude client', { conversationId, error: e.message });
+        if (outTrackId) {
+          await this.dingtalk.updateCard(conversationId, `❌ **Error**: ${e.message}`, true);
+        }
+        return;
       }
 
       logger.info('DingTalk-Bot', '>>> Calling Claude Code', {
@@ -276,7 +372,7 @@ export class DingTalkBot {
 
       startCardUpdater();
 
-      await this.claude.streamMessage({
+      await claudeClient.streamMessage({
         messages: [{ role: 'user', content: text }],
         onChunk: async (chunk: string) => {
           if (isComplete) return;
