@@ -38,4 +38,3 @@ temp/
 
 # MCP context file (written at runtime)
 .dingtalk-context.json
-script/*
